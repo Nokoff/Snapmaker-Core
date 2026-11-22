@@ -27,6 +27,95 @@ static int nibble_at(const std::vector<bool> &bitstream, size_t nibble_idx)
     return n;
 }
 
+// Paints every triangle of the test sphere the filter lets through, with a cursor that covers all of it.
+static void paint_whole_mesh(TriangleSelector &selector, EnforcerBlockerType state)
+{
+    const Transform3d                     identity = Transform3d::Identity();
+    const TriangleSelector::ClippingPlane no_clipping;
+    selector.select_patch(0,
+                          TriangleSelector::SinglePointCursor::cursor_factory(Vec3f(0.f, 0.f, 5.f), Vec3f(0.f, 0.f, 100.f), 50.f,
+                                                                              TriangleSelector::CursorType::SPHERE, identity, no_clipping),
+                          state, identity, true);
+}
+
+TEST_CASE("Replace-only painting recolours just the filament being replaced", "[TriangleSelector][Replace]")
+{
+    const TriangleMesh mesh = test_mesh();
+    TriangleSelector   selector(mesh);
+    for (int facet = 0; facet < int(mesh.its.indices.size()); ++facet)
+        selector.set_facet(facet, facet % 2 ? EnforcerBlockerType::Extruder1 : EnforcerBlockerType::Extruder2);
+    const int replaced = selector.num_facets(EnforcerBlockerType::Extruder1);
+    const int kept     = selector.num_facets(EnforcerBlockerType::Extruder2);
+
+    selector.set_replace_filter({EnforcerBlockerType::Extruder1});
+    paint_whole_mesh(selector, EnforcerBlockerType::Extruder3);
+
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder3) == replaced);
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) == kept);
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder1) == 0);
+}
+
+TEST_CASE("Replace-only painting keeps the other filaments inside a split triangle", "[TriangleSelector][Replace]")
+{
+    const TriangleMesh mesh = test_mesh();
+
+    // Facet 0 split once, into a leaf of filament 1 and a leaf of filament 2; the rest unpainted
+    TriangleSelector::TriangleSplittingData data;
+    data.triangles_to_split.emplace_back(0, 0);
+    for (int nibble : {0b1001, 0b1000, 0b0100}) {
+        for (int bit = 0; bit < 4; ++bit)
+            data.bitstream.push_back((nibble >> bit) & 1);
+    }
+    data.reset_used_states();
+    REQUIRE(data.update_used_states(0));
+    TriangleSelector selector(mesh);
+    selector.deserialize(data);
+    REQUIRE(selector.num_facets(EnforcerBlockerType::Extruder1) == 1);
+    REQUIRE(selector.num_facets(EnforcerBlockerType::Extruder2) == 1);
+    const int unpainted = selector.num_facets(EnforcerBlockerType::NONE);
+
+    selector.set_replace_filter({EnforcerBlockerType::Extruder1});
+    paint_whole_mesh(selector, EnforcerBlockerType::Extruder3);
+
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder3) == 1);
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) == 1);
+    CHECK(selector.num_facets(EnforcerBlockerType::NONE) == unpainted);
+}
+
+TEST_CASE("Painting overwrites every filament once the replace filter is cleared", "[TriangleSelector][Replace]")
+{
+    const TriangleMesh mesh = test_mesh();
+    TriangleSelector   selector(mesh);
+    selector.set_facet(0, EnforcerBlockerType::Extruder2);
+
+    selector.set_replace_filter({EnforcerBlockerType::Extruder1});
+    selector.clear_replace_filter();
+    paint_whole_mesh(selector, EnforcerBlockerType::Extruder3);
+
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder3) == int(mesh.its.indices.size()));
+}
+
+TEST_CASE("Swapping two filaments exchanges them and leaves unpainted facets alone", "[TriangleSelector][Replace]")
+{
+    const TriangleMesh mesh = test_mesh();
+    TriangleSelector   selector(mesh);
+    selector.set_facet(0, EnforcerBlockerType::Extruder1);
+    selector.set_facet(1, EnforcerBlockerType::Extruder2);
+    selector.set_facet(2, EnforcerBlockerType::Extruder2);
+    const int unpainted = selector.num_facets(EnforcerBlockerType::NONE);
+
+    EnforcerBlockerStateMap state_map;
+    for (size_t state = 0; state < state_map.size(); ++state)
+        state_map[state] = EnforcerBlockerType(state);
+    state_map[1] = EnforcerBlockerType::Extruder2;
+    state_map[2] = EnforcerBlockerType::Extruder1;
+    selector.remap_triangle_state(state_map);
+
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder1) == 2);
+    CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) == 1);
+    CHECK(selector.num_facets(EnforcerBlockerType::NONE) == unpainted);
+}
+
 TEST_CASE("Every extruder state survives a serialize/deserialize round trip", "[TriangleSelector]")
 {
     const TriangleMesh mesh      = test_mesh();

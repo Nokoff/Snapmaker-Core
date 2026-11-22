@@ -153,6 +153,16 @@ bool GLGizmoMmuSegmentation::on_init()
     m_desc["perform_remap"]    = _u8L("Remap filaments");
     m_desc["remap"]            = _L("Remap");
     m_desc["remap_reset"]      = _L("Reset");
+    m_desc["remap_scope"]      = _L("Apply to");
+    m_desc["remap_object"]     = _L("Selected object");
+    m_desc["remap_plate"]      = _L("Entire plate");
+    m_desc["remap_plate_tooltip"] = _L("Remap all color painting on objects on the current plate. Painting is shared by all instances of an object, "
+                                       "including copies on other plates. Unpainted surfaces keep their assigned filament.");
+
+    m_desc["replace_only"]         = _L("Replace only");
+    m_desc["replace_only_tooltip"] = _L("Paint over one filament only. Every tool then recolors just the chosen "
+                                        "filament and leaves the other colors in the painted area untouched.");
+    m_desc["replace_source"]       = _L("Filament to replace");
 
     std::pair<wxString, wxString> paint_shortcut            = {_L("Left mouse button"),         m_desc["paint"]};
     std::pair<wxString, wxString> erase_shortcut            = {shift + _L("Left mouse button"), m_desc["erase"]};
@@ -502,6 +512,28 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     }
     ImGui::PopStyleVar(2); // IndentSpacing ItemSpacing
 
+    // Orca: every tool recolors just one filament. With the height range tool this swaps a color inside a band.
+    m_imgui->bbl_checkbox(m_desc.at("replace_only"), m_replace_only);
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(m_desc.at("replace_only_tooltip"), max_tooltip_width);
+    if (m_replace_only && n_extruder_colors > 0) {
+        m_replace_source_idx = std::min(m_replace_source_idx, n_extruder_colors - 1);
+
+        int source_filament = int(m_replace_source_idx) + 1;
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc.at("replace_source"));
+        ImGui::SameLine();
+        ImGui::PushItemWidth(m_imgui->scaled(4.5f));
+        if (ImGui::InputInt("##replace_source_filament", &source_filament, 1, 10, ImGuiInputTextFlags_CharsDecimal))
+            m_replace_source_idx = size_t(std::clamp(source_filament, 1, int(n_extruder_colors)) - 1);
+        ImGui::PopItemWidth();
+
+        // A swatch, so the number is not the only cue
+        ImGui::SameLine();
+        draw_color_button(int(m_replace_source_idx) + 1, "###replace_source_color", m_extruders_colors[m_replace_source_idx],
+                          m_extruders_colors[m_replace_source_idx], false, scale);
+    }
+
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
 
     m_imgui->text(m_desc.at("tool_type"));
@@ -652,7 +684,9 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
             for (int i = 0; i < m_triangle_selectors.size(); i++) {
                 TriangleSelectorPatch* ts_mm = dynamic_cast<TriangleSelectorPatch*>(m_triangle_selectors[i].get());
+                ts_mm->set_replace_filter(get_replace_filter_states(i));
                 ts_mm->update_selector_triangles();
+                ts_mm->clear_replace_filter();
                 ts_mm->request_update_render_data(true);
             }
             update_model_object();
@@ -1007,12 +1041,34 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
 {
     size_t n_extr = std::min((size_t)EnforcerBlockerType::ExtruderMax, m_extruders_colors.size());
 
+    m_imgui->text(m_desc.at("remap_scope"));
+    if (ImGui::RadioButton(into_u8(m_desc.at("remap_object")).c_str(), !m_remap_entire_plate)) {
+        m_remap_entire_plate = false;
+        // The sources narrow to this object's filaments, so drop choices that would no longer show
+        for (size_t i = 0; i < m_extruder_remap.size(); ++i) {
+            if (m_used_filaments.count(i) == 0)
+                m_extruder_remap[i] = i;
+        }
+    }
+    if (ImGui::RadioButton(into_u8(m_desc.at("remap_plate")).c_str(), m_remap_entire_plate))
+        m_remap_entire_plate = true;
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(m_desc.at("remap_plate_tooltip"), max_tooltip_width);
+
+    // m_used_filaments only knows the selected object, while any filament may be painted elsewhere on the plate
+    std::set<size_t> plate_sources;
+    if (m_remap_entire_plate) {
+        for (size_t i = 0; i < n_extr; ++i)
+            plate_sources.insert(i);
+    }
+    const std::set<size_t>& sources = m_remap_entire_plate ? plate_sources : m_used_filaments;
+
     int displayed_count = 0;
     const int max_per_line = 8;
 
     // ORCA: Use m_used_filaments to show only relevant source filaments
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7.f * scale, 7.f * scale));
-    for (size_t src : m_used_filaments) {
+    for (size_t src : sources) {
         if (src >= n_extr) continue;
 
         if (displayed_count > 0 && (displayed_count % max_per_line != 0))
@@ -1119,6 +1175,11 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
     if (!any_change)
         return;
 
+    if (m_remap_entire_plate) {
+        this->remap_painting_on_plate(state_map);
+        return;
+    }
+
     Plater::TakeSnapshot snapshot(wxGetApp().plater(),
                                   "Remap filament assignments",
                                   UndoRedo::SnapshotType::GizmoAction);
@@ -1129,6 +1190,13 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
     if (!mo) return;
 
     bool volume_extruder_changed = false;
+
+    // Read before any is written: volumes inherit the object's filament, so reading it back would remap them twice
+    std::vector<int> original_extruder_ids;
+    for (const ModelVolume* mv : mo->volumes) {
+        if (mv->is_model_part())
+            original_extruder_ids.push_back(mv->extruder_id());
+    }
 
     for (ModelVolume* mv : mo->volumes) {
         if (!mv->is_model_part()) continue;
@@ -1141,7 +1209,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         ts->request_update_render_data(true);
 
         // ORCA: Remap base volume extruder as well if selected
-        int current_ext_id = mv->extruder_id();
+        int current_ext_id = original_extruder_ids[idx];
         int current_idx = (current_ext_id > 0) ? current_ext_id - 1 : 0;
 
         if (current_idx >= 0 && current_idx < m_extruder_remap.size()) {
@@ -1180,6 +1248,78 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         // ORCA: Refresh used filaments cache
         this->update_used_filaments();
     }
+}
+
+// Orca: remaps only painting. Base filaments are left alone, since they belong to objects the user has not selected.
+void GLGizmoMmuSegmentation::remap_painting_on_plate(const EnforcerBlockerStateMap& state_map)
+{
+    const ModelObject* selected_object = m_c->selection_info()->model_object();
+    Plater*            plater          = wxGetApp().plater();
+    PartPlateList&     plates          = plater->get_partplate_list();
+    PartPlate*         plate           = plates.get_selected_plate();
+    if (selected_object == nullptr || plate == nullptr)
+        return;
+
+    Plater::TakeSnapshot snapshot(plater, "Remap filament assignments", UndoRedo::SnapshotType::GizmoAction);
+
+    bool                   updated = false;
+    const ModelObjectPtrs& objects = wxGetApp().model().objects;
+    for (size_t obj_idx = 0; obj_idx < objects.size(); ++obj_idx) {
+        ModelObject* object   = objects[obj_idx];
+        bool         on_plate = false;
+        for (size_t i = 0; i < object->instances.size() && !on_plate; ++i)
+            on_plate = plate->contain_instance(int(obj_idx), int(i));
+        if (!on_plate)
+            continue;
+
+        bool   object_updated = false;
+        size_t mesh_idx       = 0;
+        for (ModelVolume* volume : object->volumes) {
+            if (!volume->is_model_part())
+                continue;
+            if (object == selected_object) {
+                // The live selectors hold this painting session
+                TriangleSelectorGUI* selector = m_triangle_selectors[mesh_idx].get();
+                selector->remap_triangle_state(state_map);
+                selector->request_update_render_data(true);
+                object_updated |= volume->mmu_segmentation_facets.set(*selector);
+            } else if (!volume->mmu_segmentation_facets.empty()) {
+                TriangleSelector selector(volume->mesh());
+                selector.deserialize(volume->mmu_segmentation_facets.get_data(), false);
+                selector.remap_triangle_state(state_map);
+                object_updated |= volume->mmu_segmentation_facets.set(selector);
+            }
+            ++mesh_idx;
+        }
+        if (!object_updated)
+            continue;
+
+        wxGetApp().obj_list()->update_info_items(obj_idx);
+        // Instances share the painting, so every plate holding one needs slicing again
+        for (size_t i = 0; i < object->instances.size(); ++i)
+            plates.notify_instance_update(int(obj_idx), int(i));
+        updated = true;
+    }
+
+    if (updated) {
+        m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+        m_parent.set_as_dirty();
+        this->update_used_filaments();
+    }
+}
+
+std::vector<EnforcerBlockerType> GLGizmoMmuSegmentation::get_replace_filter_states(int mesh_idx) const
+{
+    if (!m_replace_only || m_replace_source_idx >= m_extruders_colors.size() || m_replace_source_idx >= EXTRUDERS_LIMIT)
+        return {};
+
+    const int source = int(m_replace_source_idx) + 1;
+
+    std::vector<EnforcerBlockerType> states{EnforcerBlockerType(source)};
+    // Unpainted triangles are shown in the volume's own filament, so they count as that filament
+    if (mesh_idx >= 0 && mesh_idx < int(m_volumes_extruder_idxs.size()) && std::max(m_volumes_extruder_idxs[mesh_idx], 1) == source)
+        states.push_back(EnforcerBlockerType::NONE);
+    return states;
 }
 
 } // namespace Slic3r

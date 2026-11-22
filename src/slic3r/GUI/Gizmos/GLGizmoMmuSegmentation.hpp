@@ -104,6 +104,9 @@ protected:
     EnforcerBlockerType get_left_button_state_type() const override { return EnforcerBlockerType(m_selected_extruder_idx + 1); }
     EnforcerBlockerType get_right_button_state_type() const override { return EnforcerBlockerType(-1); }
 
+    // Orca: "replace only" painting - limits every tool to recoloring a single existing filament.
+    std::vector<EnforcerBlockerType> get_replace_filter_states(int mesh_idx) const override;
+
     void on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;
     void render_tooltip_button(float x, float y);
@@ -127,6 +130,10 @@ protected:
     
     // Filament remap feature
     std::vector<size_t>               m_extruder_remap;      // index → target extruder index
+    bool                              m_remap_entire_plate = false;
+    // Orca: replace-only painting. While enabled, painting recolors just m_replace_source_idx.
+    bool                              m_replace_only       = false;
+    size_t                            m_replace_source_idx = 0;
     // Colours each gradient mixed filament actually prints, bottom of the model first, mirrored
     // from Plater so the extruder swatches draw the same fade the editor previews. Plain
     // filament slots keep an empty ramp.
@@ -166,6 +173,7 @@ private:
     
     // Filament remapping methods
     void remap_filament_assignments();
+    void remap_painting_on_plate(const EnforcerBlockerStateMap& state_map);
     void render_filament_remap_ui(float window_width, float max_tooltip_width, float scale);
     // ORCA: Helper to update the cache of used filaments
     void update_used_filaments();

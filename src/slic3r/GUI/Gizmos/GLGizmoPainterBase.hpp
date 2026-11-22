@@ -259,6 +259,11 @@ protected:
     // A hit on a model part that may not be painted counts as a miss, so that the part still occludes.
     virtual bool is_mesh_paintable(int mesh_id) const { return true; }
 
+    // Orca: states the next paint operation is allowed to overwrite on the given mesh. An empty
+    // list (the default) paints over everything. Derived gizmos return a non-empty list to offer
+    // a "replace this filament only" mode, which the base class applies for the paint operation.
+    virtual std::vector<EnforcerBlockerType> get_replace_filter_states(int /* mesh_idx */) const { return {}; }
+
     float m_cursor_radius = 1.f;
     // BBS
     float m_cursor_height = 0.2f;
