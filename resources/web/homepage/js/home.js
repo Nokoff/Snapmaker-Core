@@ -17,6 +17,7 @@ function OnInit()
 	SendMsg_GetStaffPick();
 
 	Set_AccountMenu_Event();
+	MyFiles.init();
 }
 
 //------最佳打开文件的右键菜单功能----------
@@ -108,6 +109,8 @@ function SetLoginPanelVisibility(visible) {
 function HandleStudio( pVal )
 {
 	let strCmd = pVal['command'];
+	if (MyFiles.handle(pVal))
+		return;
 	
 	if (strCmd == "get_recent_projects") {
     ShowRecentFileList(pVal["response"]);
@@ -135,11 +138,12 @@ function HandleStudio( pVal )
       $("#BambuCloudSection").hide();
     }
 
-    if (providers.indexOf("orca") >= 0) {
-      $("#LeftBoard").show();
-    } else {
-      $("#LeftBoard").hide();
-    }
+    // The nav column always shows, as it is the only way to My Files. Without a provider it drops the account parts.
+    let bAccounts = providers.indexOf("orca") >= 0;
+    $("#LoginArea").toggle(bAccounts);
+    $(".BtnItem[menu='orca_cloud']").toggle(bAccounts);
+    if (!bAccounts && m_CloudMode) GotoMenu("recent");
+    $("#LeftBoard").show();
   } else if (strCmd == "network_plugin_installtip") {
     // Bambu Cloud is unreachable without the network plugin, so its row only carries the tip.
     let bMissing = pVal["show"] * 1 == 1;
@@ -184,6 +188,7 @@ function SetCloudMode( bOn )
 
 function GotoCloud()
 {
+	MyFiles.hide();
 	SetCloudMode(true);
 	SendSimpleCommand("homepage_open_cloud");
 }
@@ -214,6 +219,11 @@ function GotoMenu( strMenu )
 			$("div[board=\'"+strMenu+"\']").show();
 		}
 	}
+
+	if( strMenu=="myfiles" )
+		MyFiles.show();
+	else
+		MyFiles.hide();
 }
 
 /*------Account rows------*/

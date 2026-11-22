@@ -21,6 +21,7 @@
 #include "CommonDefs.hpp"
 #include "Config.hpp"
 #include "Polygon.hpp"
+#include <atomic>
 #include <boost/container_hash/hash.hpp>
 #include <algorithm>
 #include <boost/preprocessor/facilities/empty.hpp>
@@ -2738,7 +2739,7 @@ private:
     uint64_t                    m_timestamp { 1 };
     DynamicPrintConfig          m_data;
 
-    static uint64_t             s_last_timestamp;
+    static std::atomic<uint64_t> s_last_timestamp;
 };
 
 // const std::vector<double> &fv_matrix:  origin matrix from json

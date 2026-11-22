@@ -411,6 +411,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/TextureImportDialog.cpp
     GUI/TextureImportDialog.hpp
     GUI/Mouse3DController.cpp
+    GUI/MyFilesLibrary.cpp
+    GUI/MyFilesLibrary.hpp
     GUI/Mouse3DController.hpp
     GUI/MsgDialog.cpp
     GUI/MsgDialog.hpp
@@ -759,6 +761,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/CloudDeleteQueue.cpp
     Utils/CloudDeleteQueue.hpp
     Utils/ColorSpaceConvert.cpp
+    Utils/MyFilesPaths.cpp
+    Utils/MyFilesPaths.hpp
     Utils/ColorSpaceConvert.hpp
     Utils/CrealityCfs.cpp
     Utils/CrealityCfs.hpp

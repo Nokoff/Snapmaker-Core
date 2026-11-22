@@ -54,6 +54,7 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_printer_agent.cpp
     test_post_processor.cpp
     test_printhost.cpp
+    test_my_files_paths.cpp
     test_slicing_pipeline_bindings.cpp
     test_slicing_pipeline_config.cpp
     test_plugin_sort.cpp

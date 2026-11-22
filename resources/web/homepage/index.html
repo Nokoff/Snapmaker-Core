@@ -7,6 +7,7 @@
 <title>homepage</title>
 <link rel="stylesheet" type="text/css" href="../include/global.css" />	<!-- ORCA One for all-->
 <link rel="stylesheet" type="text/css" href="./css/home.css" />
+<link rel="stylesheet" type="text/css" href="./css/myfiles.css" />
 <!-- <link rel="stylesheet" type="text/css" href="./css/dark.css" />	 -->
 
 <script type="text/javascript" src="../include/jquery-3.6.0.min.js"></script>
@@ -17,6 +18,7 @@
 <script type="text/javascript" src="../include/swiper/swiper-bundle.min.js"></script>
 <script type="text/javascript" src="../include/i18n.js"></script>		
 	
+<script type="text/javascript" src="js/myfiles.js"></script>
 <script type="text/javascript" src="js/home.js"></script>
 </head>
 <body class="thin-scroll" onLoad="OnInit()">
@@ -98,6 +100,10 @@
 			<div>Wiki</div>
 			<div class="ShortcutIcon icon16"></div>
 		</div>
+		<div menu="myfiles" class="BtnItem" onClick="GotoMenu('myfiles')">
+			<div data-i18n="my_files">My Files</div>
+			<div class="NavArrow icon16"></div>
+		</div>
 	</div>
 </div>
 
@@ -175,7 +181,68 @@
 	-->	
 </div>
 
-</div>	
+<div id="MyFilesBoard" class="thin-scroll" board="myfiles">
+	<div id="MyFilesHeader">
+		<div class="Content-Title TextS1" data-i18n="my_files">My Files</div>
+		<div id="MyFilesActions">
+			<label id="MyFilesRecursiveBlock">
+				<input id="MyFilesRecursive" type="checkbox" />
+				<span data-i18n="myfiles_recursive">Include sub-folders</span>
+			</label>
+			<div id="MyFilesSortBlock">
+				<label for="MyFilesSort" data-i18n="myfiles_sort_by">Sort by</label>
+				<select id="MyFilesSort">
+					<option value="date_desc" data-i18n="myfiles_newest">Newest first</option>
+					<option value="date_asc" data-i18n="myfiles_oldest">Oldest first</option>
+					<option value="name_asc" data-i18n="myfiles_name_asc">Name (A-Z)</option>
+					<option value="name_desc" data-i18n="myfiles_name_desc">Name (Z-A)</option>
+				</select>
+			</div>
+			<div id="MyFilesUpBtn" class="ButtonStyleRegular ButtonTypeWindow" data-i18n="myfiles_up">Up</div>
+			<div id="MyFilesRefreshBtn" class="ButtonStyleRegular ButtonTypeWindow" data-i18n="myfiles_refresh">Refresh</div>
+			<div id="MyFilesChangeBtn" class="ButtonStyleRegular ButtonTypeWindow" data-i18n="myfiles_change_folder">Change Folder</div>
+		</div>
+	</div>
+	<div id="MyFilesBreadcrumb"></div>
+	<div id="MyFilesPath"></div>
+
+	<div id="MyFilesNoFolder">
+		<div class="TextS2" data-i18n="myfiles_no_folder_desc">Select a folder to browse your local models and projects.</div>
+		<div id="MyFilesChooseBtn" class="MenuItem">
+			<div class="MenuIcon"><img src="img/i5.png" alt="" /></div>
+			<div>
+				<div class="TextS1" data-i18n="myfiles_choose_folder">Choose Folder</div>
+				<div class="MenuDesc" data-i18n="myfiles_no_folder">No folder mapped</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="MyFilesTruncated" data-i18n="myfiles_truncated">More files were found than can be listed at once. Some are not shown.</div>
+	<div id="MyFilesProgress">
+		<span data-i18n="myfiles_progress">Generating previews</span>
+		<span id="MyFilesProgressCount"></span>
+		<div id="MyFilesProgressTrack"><div id="MyFilesProgressBar"></div></div>
+	</div>
+	<div id="MyFilesHint"><span id="MyFilesHintText"></span></div>
+
+	<div id="MyFilesSelectionBar">
+		<div id="MyFilesSelectedCount"></div>
+		<div id="MyFilesMoveBtn" class="ButtonStyleRegular ButtonTypeWindow" data-i18n="myfiles_move">Move to...</div>
+		<div id="MyFilesDeleteBtn" class="ButtonStyleAlert ButtonTypeWindow" data-i18n="myfiles_delete">Delete</div>
+		<div id="MyFilesClearBtn" class="ButtonStyleRegular ButtonTypeWindow" data-i18n="myfiles_clear">Clear selection</div>
+	</div>
+
+	<div id="MyFilesEmpty"></div>
+	<div id="MyFilesList"></div>
+
+	<div id="MyFilesMenu">
+		<div id="MyFilesMenuExplore" class="MyFilesMenuItem" data-i18n="show_in_folder">Show in folder</div>
+		<div id="MyFilesMenuMove" class="MyFilesMenuItem" data-i18n="myfiles_move">Move to...</div>
+		<div id="MyFilesMenuDelete" class="MyFilesMenuItem" data-i18n="myfiles_delete">Delete</div>
+	</div>
+</div>
+
+</div>
 </body>
 <script type="text/javascript">
 	//HandleStudio(TestData);

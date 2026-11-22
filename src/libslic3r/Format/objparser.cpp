@@ -377,7 +377,7 @@ static bool obj_parseline(const char *line, ObjData &data)
 
 	return true;
 }
-static std::string cur_mtl_name = "";
+static thread_local std::string cur_mtl_name; // OBJ files are also parsed by the My Files workers
 static bool mtl_is_space(char c)
 {
     return c == ' ' || c == '\t' || c == '\r';

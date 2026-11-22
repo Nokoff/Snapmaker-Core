@@ -496,6 +496,10 @@ void AppConfig::set_defaults()
     if (get("stealth_mode").empty()) {
         set_bool("stealth_mode", false);
     }
+    if (get("my_files_path").empty()) {
+        set("my_files_path", "");
+    }
+
     if (get("hide_login_side_panel").empty()) {
         set_bool("hide_login_side_panel", false);
     }

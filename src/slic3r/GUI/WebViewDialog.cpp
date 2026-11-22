@@ -1,4 +1,5 @@
 #include "WebViewDialog.hpp"
+#include "MyFilesLibrary.hpp"
 
 #include "CloudProvider.hpp"
 #include "I18N.hpp"
@@ -89,6 +90,30 @@ static json home_page_strings()
         {"clear_all", _u8L("Clear all")},
         {"remove", _u8L("Remove")},
         {"show_in_folder", _u8L("Show in folder")},
+        {"my_files", _u8L("My Files")},
+        {"myfiles_up", _u8L("Up")},
+        {"myfiles_recursive", _u8L("Include sub-folders")},
+        {"myfiles_sort_by", _u8L("Sort by")},
+        {"myfiles_newest", _u8L("Newest first")},
+        {"myfiles_oldest", _u8L("Oldest first")},
+        {"myfiles_name_asc", _u8L("Name (A-Z)")},
+        {"myfiles_name_desc", _u8L("Name (Z-A)")},
+        {"myfiles_refresh", _u8L("Refresh")},
+        {"myfiles_choose_folder", _u8L("Choose Folder")},
+        {"myfiles_change_folder", _u8L("Change Folder")},
+        {"myfiles_no_folder", _u8L("No folder mapped")},
+        {"myfiles_no_folder_desc", _u8L("Select a folder to browse your local models and projects.")},
+        // TRN %s is the number of selected files
+        {"myfiles_selected", _u8L("Selected: %s")},
+        {"myfiles_delete", _u8L("Delete")},
+        {"myfiles_move", _u8L("Move to...")},
+        {"myfiles_clear", _u8L("Clear selection")},
+        {"myfiles_empty", _u8L("No supported files found in this folder.")},
+        {"myfiles_empty_recursive", _u8L("No supported files in this folder or below it.")},
+        {"myfiles_truncated", _u8L("More files were found than can be listed at once. Some are not shown.")},
+        {"myfiles_progress", _u8L("Generating previews")},
+        {"myfiles_hint", _u8L("Double-click to open a file or folder. Ctrl+click or Shift+click to select several files. Backspace goes up a folder.")},
+        {"myfiles_hint_mac", _u8L("Double-click to open a file or folder. \u2318+click or Shift+click to select several files. Backspace goes up a folder.")},
     };
 }
 
@@ -1059,6 +1084,12 @@ void WebViewPanel::OnScriptMessage(wxWebViewEvent& evt)
 
     if (wxGetApp().get_mode() == comDevelop)
         wxLogMessage("Script message received; value = %s, handler = %s", evt.GetString(), evt.GetMessageHandler());
+    // My Files can delete and move files, so only the bundled page may drive it, whatever else this view has loaded
+    const wxString page = m_browser->GetCurrentURL();
+    if (page.Lower().StartsWith("file:") && page.Contains("/web/homepage/index.html") &&
+        MyFilesLibrary::handle_request(evt.GetString().ToUTF8().data()))
+        return;
+
     std::string response = wxGetApp().handle_web_request(evt.GetString().ToUTF8().data());
     if (response.empty()) return;
 
