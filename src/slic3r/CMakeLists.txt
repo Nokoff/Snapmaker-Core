@@ -763,6 +763,7 @@ set(SLIC3R_GUI_SOURCES
     Utils/ColorSpaceConvert.cpp
     Utils/MyFilesPaths.cpp
     Utils/MyFilesPaths.hpp
+    Utils/ProjectPaths.hpp
     Utils/ColorSpaceConvert.hpp
     Utils/CrealityCfs.cpp
     Utils/CrealityCfs.hpp

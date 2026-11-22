@@ -247,6 +247,7 @@
 #include "../Utils/UndoRedo.hpp"
 #include "../Utils/PresetUpdater.hpp"
 #include "../Utils/Process.hpp"
+#include "../Utils/ProjectPaths.hpp"
 #include "RemovableDriveManager.hpp"
 #include "InstanceCheck.hpp"
 #include "NotificationManager.hpp"
@@ -14841,9 +14842,8 @@ void Plater::priv::set_project_filename(const wxString& filename)
     //    // Remove just one extension.
     //    full_path.replace_extension("");
     //}
+    m_project_folder = ProjectPaths::project_folder(full_path, q->m_only_gcode);
     full_path.replace_extension("");
-
-    m_project_folder = full_path.parent_path();
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << __LINE__ << " project folder is:" << m_project_folder.string();
 
     //BBS
@@ -14857,7 +14857,8 @@ void Plater::priv::set_project_filename(const wxString& filename)
 
     wxGetApp().mainframe->update_title();
 
-    if (!m_project_folder.empty() && !q->m_only_gcode)
+    // A model has no project folder, but still belongs in Recent
+    if (full_path.has_parent_path() && !q->m_only_gcode)
         wxGetApp().mainframe->add_to_recent_projects(filename);
 }
 
@@ -16679,8 +16680,9 @@ int Plater::save_project(bool saveAs)
         saveAs = true;
     if (saveAs)
         filename = p->get_export_file(FT_3MF);
+    // Empty when replacing a file was declined: nothing was saved, so a pending close must not discard the project
     if (filename.empty())
-        return wxID_NO;
+        return wxID_CANCEL;
     if (filename == "<cancel>")
         return wxID_CANCEL;
 
