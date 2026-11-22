@@ -32,7 +32,7 @@ public:
 
 protected:
     // Saves the Box slot picked for each filament in the print dialog, then starts the print through Moonraker
-    bool print_uploaded_file(const PrintParams& params, const std::string& filename) override;
+    bool print_uploaded_file(const PrintParams& params, const std::string& filename, std::string& error) override;
     std::string ams_unit_name(int ams_id) const override { return "Qidi Box " + std::to_string(ams_id + 1); }
 
 private:

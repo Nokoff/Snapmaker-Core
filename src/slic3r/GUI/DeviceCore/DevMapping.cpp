@@ -19,6 +19,13 @@
 // TODO: remove this include
 #include "slic3r/GUI/DeviceManager.hpp"
 #include "slic3r/GUI/GuiColor.hpp"
+#include "slic3r/Utils/ColorSpaceConvert.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <optional>
 
 namespace Slic3r
 {
@@ -114,6 +121,160 @@ namespace Slic3r
                 result.id = ams_id * 4 + slot_id;
             }
         }
+    }
+
+    namespace {
+
+    struct LabColour
+    {
+        double l, a, b;
+        double chroma() const { return std::hypot(a, b); }
+        double hue() const { return std::atan2(b, a); }
+    };
+
+    // RGB2Lab rounds the sRGB constants differently, which can change the winner between close colours,
+    // so this uses the ones the U1's own app uses.
+    std::optional<LabColour> parse_lab(std::string hex)
+    {
+        if (!hex.empty() && hex.front() == '#')
+            hex.erase(0, 1);
+        if ((hex.size() != 6 && hex.size() != 8) ||
+            !std::all_of(hex.begin(), hex.end(), [](unsigned char ch) { return std::isxdigit(ch) != 0; }))
+            return std::nullopt;
+
+        std::array<double, 3> rgb;
+        for (size_t i = 0; i < rgb.size(); ++i) {
+            const double value = std::stoi(hex.substr(2 * i, 2), nullptr, 16) / 255.0;
+            rgb[i]             = value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+        }
+        const auto f = [](double t) { return t > 216.0 / 24389.0 ? std::cbrt(t) : (24389.0 / 27.0 * t + 16.0) / 116.0; };
+        const double x = f((0.4124564 * rgb[0] + 0.3575761 * rgb[1] + 0.1804375 * rgb[2]) / 0.95047);
+        const double y = f(0.2126729 * rgb[0] + 0.7151522 * rgb[1] + 0.072175 * rgb[2]);
+        const double z = f((0.0193339 * rgb[0] + 0.119192 * rgb[1] + 0.9503041 * rgb[2]) / 1.08883);
+        return LabColour{116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z)};
+    }
+
+    // Lower case without separators, so "PLA-CF", "PLA CF" and "pla_cf" are one material
+    std::string material_key(const std::string& type)
+    {
+        std::string key;
+        for (const unsigned char ch : type) {
+            if (ch != '-' && ch != '_' && ch != ' ')
+                key += static_cast<char>(std::tolower(ch));
+        }
+        return key;
+    }
+
+    struct SlotCandidate
+    {
+        FilamentInfo             info;
+        std::optional<LabColour> single_colour; // empty for a multi-colour spool
+        double                   distance;
+    };
+
+    const SlotCandidate* pick_slot(const std::optional<LabColour>& target, const std::vector<SlotCandidate>& slots)
+    {
+        const auto closer = [](const SlotCandidate& a, const SlotCandidate* b) {
+            return !b || a.distance < b->distance || (a.distance == b->distance && a.info.tray_id < b->info.tray_id);
+        };
+        const SlotCandidate* best = nullptr;
+        for (const SlotCandidate& slot : slots) {
+            if (closer(slot, best))
+                best = &slot;
+        }
+        if (!best || best->distance == 0.0)
+            return best;
+
+        // CIEDE2000 ranks black closest to many dark colours. When a coloured filament lost to a neutral
+        // one, a slot of nearly the same hue that is not far worse wins. These bounds are product policy.
+        constexpr double MIN_LIGHTNESS     = 5.0; // hue is noise closer to black
+        constexpr double MIN_CHROMA        = 10.0;
+        constexpr double NEUTRAL_CHROMA    = 8.0;
+        constexpr double PI_VALUE          = 3.14159265358979323846;
+        constexpr double MAX_HUE_GAP       = PI_VALUE / 6.0;
+        constexpr double MAX_DISTANCE      = 45.0;
+        constexpr double MAX_EXTRA_OVER    = 25.0;
+
+        const auto& winner = best->single_colour;
+        if (!target || !winner || target->l < MIN_LIGHTNESS || target->chroma() < MIN_CHROMA || winner->chroma() >= NEUTRAL_CHROMA)
+            return best;
+
+        const SlotCandidate* preferred = nullptr;
+        for (const SlotCandidate& slot : slots) {
+            const auto& colour = slot.single_colour;
+            if (!colour || colour->l < MIN_LIGHTNESS || colour->chroma() < MIN_CHROMA)
+                continue;
+            double hue_gap = std::abs(colour->hue() - target->hue());
+            hue_gap        = std::min(hue_gap, 2.0 * PI_VALUE - hue_gap);
+            if (hue_gap > MAX_HUE_GAP || slot.distance > MAX_DISTANCE || slot.distance > best->distance + MAX_EXTRA_OVER)
+                continue;
+            if (closer(slot, preferred))
+                preferred = &slot;
+        }
+        return preferred ? preferred : best;
+    }
+
+    } // namespace
+
+    int DevMappingUtil::snapmaker_filament_mapping(const MachineObject* obj, const std::vector<FilamentInfo>& filaments, std::vector<FilamentInfo>& result)
+    {
+        if (filaments.empty())
+            return -1;
+
+        result.clear();
+        for (const FilamentInfo& filament : filaments) {
+            std::string wanted = filament.type;
+            // Orca renames support PLA and PA, while the printer reports their base material
+            if (wanted == "PLA-S" || wanted == "PA-S")
+                wanted.resize(wanted.size() - 2);
+            const std::string wanted_key = material_key(wanted);
+            const auto        target     = parse_lab(filament.color);
+
+            std::vector<SlotCandidate> slots;
+            for (const auto& [ams_key, ams] : obj->GetFilaSystem()->GetAmsList()) {
+                const int ams_id = std::atoi(ams_key.c_str());
+                for (const auto& [tray_key, tray] : ams->GetTrays()) {
+                    if (!tray->is_exists || tray->m_fila_type.empty())
+                        continue;
+                    if (wanted_key != material_key(tray->m_fila_type) && wanted_key != material_key(tray->m_fila_type + tray->sub_type))
+                        continue;
+                    if (filament.nozzle_diameter > 0.0 && tray->nozzle_diameter > 0.f &&
+                        std::abs(filament.nozzle_diameter - tray->nozzle_diameter) > 0.001)
+                        continue;
+
+                    const int     slot_id = std::atoi(tray_key.c_str());
+                    SlotCandidate slot{{}, std::nullopt, std::numeric_limits<double>::infinity()};
+                    _parse_tray_info(ams_id, slot_id, DevAms::AMS_LITE, *tray, slot.info);
+                    slot.info.tray_id = slot.info.id;
+
+                    const bool multi = tray->cols.size() > 1;
+                    if (!multi)
+                        slot.single_colour = parse_lab(tray->color);
+                    if (target) {
+                        for (const std::string& hex : multi ? tray->cols : std::vector<std::string>{tray->color}) {
+                            if (const auto colour = parse_lab(hex))
+                                slot.distance = std::min<double>(slot.distance,
+                                    DeltaE00(target->l, target->a, target->b, colour->l, colour->a, colour->b));
+                        }
+                    }
+                    slots.push_back(std::move(slot));
+                }
+            }
+
+            FilamentInfo mapped;
+            if (const SlotCandidate* slot = pick_slot(target, slots)) {
+                mapped          = slot->info;
+                mapped.distance = static_cast<float>(slot->distance);
+            } else {
+                mapped.tray_id     = -1;
+                mapped.type        = filament.type;
+                mapped.filament_id = filament.filament_id;
+            }
+            mapped.id = filament.id;
+            BOOST_LOG_TRIVIAL(info) << "snapmaker_filament_mapping: filament " << mapped.id << " -> toolhead " << mapped.tray_id;
+            result.push_back(std::move(mapped));
+        }
+        return 0;
     }
 
     int DevMappingUtil::ams_filament_mapping(const MachineObject* obj, const std::vector<FilamentInfo>& filaments, std::vector<FilamentInfo>& result, std::vector<bool> map_opt, std::vector<int> exclude_id, bool nozzle_has_ams_then_ignore_ext)

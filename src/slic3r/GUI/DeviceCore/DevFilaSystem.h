@@ -62,6 +62,8 @@ public:
     std::string              filament_setting_id; // setting_id
     std::string              m_fila_type;
     std::string              sub_brands;
+    std::string              sub_type;                  // Orca: finish the printer reports beside the type ("Silk")
+    float                    nozzle_diameter = 0.f;     // Orca: of the toolhead that owns this slot, 0 when unknown
     std::string              color;
     std::vector<std::string> cols;
     std::string              weight;

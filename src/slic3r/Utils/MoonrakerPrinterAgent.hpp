@@ -114,6 +114,8 @@ protected:
                                               // Used when it holds two or more; otherwise tray_color is the only one.
         bool        colors_gradient = false;  // With tray_colors: blend them as a gradient instead of drawing segments
         std::string tray_info_idx;       // Filament ID (optional)
+        std::string tray_sub_type;       // Optional: finish reported beside the type (e.g., "Silk")
+        float       nozzle_diameter = 0.f; // Optional: of the toolhead that owns this slot
         int         bed_temp = 0;        // Optional
         int         nozzle_temp = 0;     // Optional
     };
@@ -131,8 +133,10 @@ protected:
                                    MoonrakerDeviceInfo&         info,
                                    std::string&                 error,
                                    const std::function<bool()>& cancelled) const;
-    // Starts the print of a file already uploaded to the gcodes root
-    virtual bool print_uploaded_file(const PrintParams& params, const std::string& filename);
+    // Starts the print of a file already uploaded to the gcodes root. On failure `error` may say why, for the user.
+    virtual bool print_uploaded_file(const PrintParams& params, const std::string& filename, std::string& error);
+    // Whether the printer can calibrate flow as part of starting a print
+    virtual bool supports_flow_calibration() const { return false; }
     // Whether the printer prints a .gcode.3mf bundle as is (its use_3mf option)
     virtual bool accepts_3mf() const;
     void start_status_stream(const std::string& dev_id, const std::string& base_url, const std::string& api_key);
@@ -150,6 +154,12 @@ protected:
     // Posts the request to /printer/print/start
     bool send_jsonrpc_command(const std::string& base_url, const std::string& api_key,
                               const nlohmann::json& request, std::string& response) const;
+    // Makes one JSON-RPC call on a websocket of its own, for methods Moonraker does not serve over HTTP.
+    // Returns whether an answer arrived within `timeout`; that answer may itself be an error.
+    bool call_websocket_method(const std::string&        method,
+                               const nlohmann::json&     params,
+                               std::chrono::milliseconds timeout,
+                               nlohmann::json&           response) const;
 
     // Trim whitespace and convert to uppercase
     static std::string trim_and_upper(const std::string& input);

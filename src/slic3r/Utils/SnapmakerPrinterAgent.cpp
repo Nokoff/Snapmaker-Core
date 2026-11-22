@@ -5,8 +5,12 @@
 #include "NetworkAgentFactory.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/I18N.hpp"
+#include "slic3r/GUI/format.hpp"
+#include "bambu_networking.hpp"
 
 #include "nlohmann/json.hpp"
+#include <chrono>
 #include <boost/log/trivial.hpp>
 #include <vector>
 #include <string>
@@ -21,6 +25,15 @@ namespace Slic3r {
 namespace {
 
 constexpr const char* SNAPMAKER_AGENT_VERSION = "0.0.1";
+
+// print_task_config.py in the U1's Klipper: G-code tools are logical and are mapped to toolheads at print time
+constexpr int LOGICAL_EXTRUDER_COUNT  = 32;
+constexpr int PHYSICAL_EXTRUDER_COUNT = 4;
+
+// The printer answers only once it has scanned the file's metadata and Klipper has started it
+constexpr std::chrono::minutes START_PRINT_TIMEOUT{3};
+
+constexpr int JSONRPC_METHOD_NOT_FOUND = -32601;
 
 // Ranks a candidate that declares no usable colour behind every candidate that does, while
 // still leaving it ahead of no match at all. The largest real distance is 3 * 255^2 = 195075.
@@ -257,9 +270,90 @@ std::string SnapmakerPrinterAgent::combine_filament_type(const std::string& type
     return base;
 }
 
+bool SnapmakerPrinterAgent::build_print_options(const PrintParams& params, nlohmann::json& options, std::string& error)
+{
+    // Moonraker passes each value on as KEY="str(value)" and Klipper reads these as integers, so no booleans
+    options = {{"bed_level", params.task_bed_leveling ? 1 : 0},
+               {"flow_calibrate", params.task_flow_cali ? 1 : 0},
+               {"time_lapse_camera", params.task_record_timelapse ? 1 : 0}};
+    // Jobs without a mapping, such as calibrations, print each tool from the toolhead of the same number:
+    // the printer resets its table when it gets none.
+    if (params.ams_mapping.empty())
+        return true;
+
+    const auto mapping = nlohmann::json::parse(params.ams_mapping, nullptr, false);
+    if (!mapping.is_array()) {
+        error = _u8L("The toolhead assignment of this print could not be read.");
+        return false;
+    }
+    // The dialog gives a source colour to every filament the plate uses, and -1 both to the unused
+    // ones and to those mapped to an external spool, which the U1 does not have.
+    const auto info = nlohmann::json::parse(params.ams_mapping_info, nullptr, false);
+
+    auto table = nlohmann::json::array();
+    for (size_t i = 0; i < mapping.size(); ++i) {
+        const int toolhead = mapping[i].is_number_integer() ? mapping[i].get<int>() : PHYSICAL_EXTRUDER_COUNT;
+        if (toolhead == -1) {
+            if (info.is_array() && i < info.size() && info[i].contains("sourceColor")) {
+                error = GUI::format(_u8L("Filament %1% has no toolhead assigned. Select a toolhead for it and try again."), i + 1);
+                return false;
+            }
+            continue;
+        }
+        if (i >= static_cast<size_t>(LOGICAL_EXTRUDER_COUNT)) {
+            error = GUI::format(_u8L("The printer cannot map filament %1%. It supports filaments 1 to %2%."), i + 1,
+                                LOGICAL_EXTRUDER_COUNT);
+            return false;
+        }
+        if (toolhead < 0 || toolhead >= PHYSICAL_EXTRUDER_COUNT) {
+            error = GUI::format(_u8L("Filament %1% is assigned to a toolhead the printer does not have."), i + 1);
+            return false;
+        }
+        table.push_back({i, toolhead});
+    }
+    if (table.empty()) {
+        error = _u8L("No filament of this print has a toolhead assigned.");
+        return false;
+    }
+    options["map_table"] = std::move(table);
+    return true;
+}
+
+bool SnapmakerPrinterAgent::print_uploaded_file(const PrintParams& params, const std::string& filename, std::string& error)
+{
+    nlohmann::json options;
+    if (!build_print_options(params, options, error))
+        return false;
+
+    // Plain SDCARD_PRINT_FILE would print with whatever map the previous job left. The method is websocket only.
+    nlohmann::json response;
+    if (!call_websocket_method("server.files.start_local_print", {{"path", filename}, {"options", options}}, START_PRINT_TIMEOUT,
+                               response)) {
+        error = _u8L("The printer did not confirm that the print started. Check the printer before sending the job again.");
+        return false;
+    }
+
+    if (const auto rpc_error = response.find("error"); rpc_error != response.end()) {
+        if (rpc_error->is_object() && safe_json_int(*rpc_error, "code") == JSONRPC_METHOD_NOT_FOUND)
+            error = _u8L("This printer firmware cannot receive a toolhead assignment. Update it to 1.3.0 or later.");
+        else if (rpc_error->is_object())
+            error = safe_json_string(*rpc_error, "message");
+    } else if (const auto result = response.find("result"); result != response.end() && result->is_object()) {
+        // A refused start is still a successful RPC
+        if (safe_json_string(*result, "state") == "success")
+            return true;
+        error = safe_json_string(*result, "message");
+    }
+
+    if (error.empty())
+        error = _u8L("The printer refused to start the print.");
+    BOOST_LOG_TRIVIAL(error) << "SnapmakerPrinterAgent::print_uploaded_file: " << response.dump();
+    return false;
+}
+
 bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode /*sync_mode*/)
 {
-    std::string url = join_url(device_info.base_url, "/printer/objects/query?print_task_config&filament_detect");
+    std::string url = join_url(device_info.base_url, "/printer/objects/query?print_task_config&filament_detect&extruder&extruder1&extruder2&extruder3");
 
     std::string response_body;
     bool        success = false;
@@ -327,6 +421,9 @@ bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
         nfc_info = json["result"]["status"]["filament_detect"]["info"];
     }
 
+    const auto& status      = json["result"]["status"];
+    const auto  color_multi = ptc.value("filament_color_multi", nlohmann::json::array());
+
     static const std::string empty_str;
     static const std::string default_color = "FFFFFFFF";
 
@@ -344,6 +441,27 @@ bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
             tray.tray_color    = safe_at(filament_color, i, empty_str);
             if (tray.tray_color.empty())
                 tray.tray_color = default_color;
+
+            if (trim_and_upper(raw_sub_type) != "NONE")
+                tray.tray_sub_type = raw_sub_type;
+
+            // Slots and toolheads are one to one, and Klipper names them extruder, extruder1, ...
+            if (const auto head = status.find(i == 0 ? "extruder" : "extruder" + std::to_string(i));
+                head != status.end() && head->is_object()) {
+                if (const auto size = head->find("nozzle_diameter"); size != head->end() && size->is_number())
+                    tray.nozzle_diameter = size->get<float>();
+            }
+
+            if (color_multi.is_array() && i < static_cast<int>(color_multi.size()) && color_multi[i].is_object()) {
+                const auto& multi = color_multi[i];
+                const int   count = safe_json_int(multi, "nums");
+                if (const auto colors = multi.find("colors"); count > 1 && colors != multi.end() && colors->is_array()) {
+                    for (int k = 0; k < count && k < static_cast<int>(colors->size()); ++k) {
+                        if ((*colors)[k].is_string())
+                            tray.tray_colors.push_back((*colors)[k].get<std::string>());
+                    }
+                }
+            }
 
             auto* bundle = GUI::wxGetApp().preset_bundle;
             // Try to find a matching preset for this filament based on vendor, type and color.

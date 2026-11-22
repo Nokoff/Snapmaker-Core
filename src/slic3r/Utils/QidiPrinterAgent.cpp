@@ -121,7 +121,7 @@ std::string QidiPrinterAgent::build_tool_slot_script(const std::string& ams_mapp
     return script;
 }
 
-bool QidiPrinterAgent::print_uploaded_file(const PrintParams& params, const std::string& filename)
+bool QidiPrinterAgent::print_uploaded_file(const PrintParams& params, const std::string& filename, std::string& /*error*/)
 {
     const std::string script = build_tool_slot_script(params.ams_mapping);
     if (!script.empty() && !send_gcode_sync(device_info.dev_id, script)) {

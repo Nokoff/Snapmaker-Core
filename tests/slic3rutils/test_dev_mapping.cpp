@@ -21,6 +21,9 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <cstddef>
+#include <string>
+
 #include <wx/timer.h>
 
 #include "slic3r/GUI/DeviceManager.hpp"
@@ -253,4 +256,132 @@ TEST_CASE("Switch-bound AMS with an invalid track is excluded from mapping", "[D
     REQUIRE_FALSE(obj_no_switch.GetFilaSwitch()->IsInstalled());
     DevFilaSystemParser::ParseV1_0(print_push, &obj_no_switch, obj_no_switch.GetFilaSystem().get(), false);
     REQUIRE(obj_no_switch.GetFilaSystem()->GetAmsList().count("0") == 0);
+}
+
+namespace {
+
+struct U1Slot
+{
+    std::string color; // RRGGBBAA, or empty for an empty slot
+    std::string type     = "PLA";
+    std::string sub_type = "";
+    float       diameter = 0.4f;
+    std::vector<std::string> colors = {};
+};
+
+// The toolhead each wanted filament gets from a U1 loaded with `slots`.
+std::vector<int> map_on_u1(const std::vector<U1Slot>& slots, const std::vector<FilamentInfo>& wanted)
+{
+    MachineObject obj(nullptr, nullptr, "test", "test_dev", "127.0.0.1");
+
+    json     trays = json::array();
+    unsigned exist = 0;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        json tray{{"id", std::to_string(i)}, {"tray_color", slots[i].color.empty() ? "00000000" : slots[i].color}};
+        tray["cols"]                 = slots[i].colors.empty() ? json::array({tray["tray_color"]}) : json(slots[i].colors);
+        tray["tray_sub_type"]        = slots[i].sub_type;
+        tray["tray_nozzle_diameter"] = slots[i].diameter;
+        trays.push_back(tray);
+        if (!slots[i].color.empty())
+            exist |= 1u << i;
+    }
+    const char digit[] = {"0123456789ABCDEF"[exist], 0};
+    const json push{{"ams", {{"tray_exist_bits", digit}, {"ams", json::array({{{"id", "0"}, {"info", "0002"}, {"tray", trays}}})}}}};
+    DevFilaSystemParser::ParseV1_0(push, &obj, obj.GetFilaSystem().get(), false);
+    // Set after the parse, which resolves types through the GUI's preset bundle
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (DevAmsTray* tray = obj.GetFilaSystem()->GetAmsTray("0", std::to_string(i)))
+            tray->m_fila_type = slots[i].type;
+    }
+
+    std::vector<FilamentInfo> result;
+    DevMappingUtil::snapmaker_filament_mapping(&obj, wanted, result);
+    std::vector<int> toolheads;
+    for (const FilamentInfo& info : result)
+        toolheads.push_back(info.tray_id);
+    return toolheads;
+}
+
+FilamentInfo wanted_filament(const std::string& color, const std::string& type = "PLA", double diameter = 0.4)
+{
+    FilamentInfo info;
+    info.color           = color;
+    info.type            = type;
+    info.nozzle_diameter = diameter;
+    return info;
+}
+
+} // namespace
+
+TEST_CASE("A dark colour maps to a U1 slot of its hue instead of black", "[DevMapping][Snapmaker]")
+{
+    const auto [wanted, coloured] = GENERATE(table<std::string, std::string>({
+        {"#003000FF", "409040FF"}, // green
+        {"#500808FF", "C04040FF"}, // red
+        {"#080840FF", "8080FFFF"}, // blue
+    }));
+    CAPTURE(wanted, coloured);
+
+    CHECK(map_on_u1({{"000000FF"}, {coloured}}, {wanted_filament(wanted)}) == std::vector<int>{1});
+}
+
+TEST_CASE("A neutral colour or a different hue leaves black as the U1 match", "[DevMapping][Snapmaker]")
+{
+    const auto [wanted, coloured] = GENERATE(table<std::string, std::string>({
+        {"#000000FF", "409040FF"}, // black
+        {"#202020FF", "409040FF"}, // charcoal
+        {"#020301FF", "409040FF"}, // hue is noise this dark
+        {"#003000FF", "E03030FF"}, // another hue
+    }));
+    CAPTURE(wanted, coloured);
+
+    CHECK(map_on_u1({{"000000FF"}, {coloured}}, {wanted_filament(wanted)}) == std::vector<int>{0});
+}
+
+TEST_CASE("The nearest coloured U1 slot wins over a brighter one of the same hue", "[DevMapping][Snapmaker]")
+{
+    CHECK(map_on_u1({{"000000FF"}, {"003000FF"}, {"409040FF"}}, {wanted_filament("#003000FF")}) == std::vector<int>{1});
+    CHECK(map_on_u1({{"407040FF"}, {"80A080FF"}}, {wanted_filament("#408040FF")}) == std::vector<int>{0});
+}
+
+TEST_CASE("Each U1 filament takes its closest slot even when another filament took it", "[DevMapping][Snapmaker]")
+{
+    const std::vector<FilamentInfo> wanted{wanted_filament("#FF0000FF"), wanted_filament("#F01010FF"), wanted_filament("#FFFFFFFF")};
+
+    CHECK(map_on_u1({{"FFFFFFFF"}, {"FF0000FF"}, {"0000FFFF"}}, wanted) == std::vector<int>{1, 1, 0});
+}
+
+TEST_CASE("Equally close U1 slots resolve to the lowest toolhead", "[DevMapping][Snapmaker]")
+{
+    CHECK(map_on_u1({{"0000FFFF"}, {"FF0000FF"}, {"FF0000FF"}}, {wanted_filament("#FF0000FF")}) == std::vector<int>{1});
+}
+
+TEST_CASE("A U1 filament only maps to a slot of its material", "[DevMapping][Snapmaker]")
+{
+    const std::vector<U1Slot> slots{{"FF0000FF", "PETG"}, {"0000FFFF", "PLA"}, {"00FF00FF", "BREAKAWAY", "Support"}};
+
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF")}) == std::vector<int>{1});
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF", "PLA-S")}) == std::vector<int>{1});
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF", "Breakaway Support")}) == std::vector<int>{2});
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF", "ABS")}) == std::vector<int>{-1});
+}
+
+TEST_CASE("A U1 filament only maps to a toolhead with the nozzle it was sliced for", "[DevMapping][Snapmaker]")
+{
+    const std::vector<U1Slot> slots{{"FF0000FF", "PLA", "", 0.4f}, {"0000FFFF", "PLA", "", 0.6f}};
+
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF", "PLA", 0.6)}) == std::vector<int>{1});
+    CHECK(map_on_u1(slots, {wanted_filament("#FF0000FF", "PLA", 0.8)}) == std::vector<int>{-1});
+}
+
+TEST_CASE("An empty U1 slot is never mapped", "[DevMapping][Snapmaker]")
+{
+    CHECK(map_on_u1({{""}, {"FFFFFFFF"}}, {wanted_filament("#000000FF")}) == std::vector<int>{1});
+}
+
+TEST_CASE("A multi-colour U1 spool matches by its closest colour", "[DevMapping][Snapmaker]")
+{
+    const std::vector<U1Slot> slots{{"F0F000FF"}, {"0000FFFF", "PLA", "", 0.4f, {"0000FFFF", "FFFF00FF"}}};
+
+    CHECK(map_on_u1(slots, {wanted_filament("#FFFF00FF")}) == std::vector<int>{1});
 }

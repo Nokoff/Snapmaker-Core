@@ -68,6 +68,8 @@ void DevAmsTray::reset()
     filament_setting_id = "";
     m_fila_type         = "";
     sub_brands          = "";
+    sub_type            = "";
+    nozzle_diameter     = 0.f;
     color               = "";
     weight              = "";
     diameter            = "";
@@ -712,6 +714,8 @@ void DevFilaSystemParser::ParseV1_0(const json& jj, MachineObject* obj, DevFilaS
                                 curr_tray->sub_brands = (*tray_it)["tray_sub_brands"].get<std::string>();
                             else
                                 curr_tray->sub_brands = "";
+                            curr_tray->sub_type        = tray_it->value("tray_sub_type", std::string());
+                            curr_tray->nozzle_diameter = tray_it->value("tray_nozzle_diameter", 0.f);
                             if (tray_it->contains("tray_weight"))
                                 curr_tray->weight = (*tray_it)["tray_weight"].get<std::string>();
                             else

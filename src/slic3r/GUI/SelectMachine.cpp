@@ -1318,7 +1318,18 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_,bool use_ams)
             map_opt[1] = false;
             map_opt[3] = true;
         }
-        filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt);
+        if (use_ams && obj_->printer_agent_id == SNAPMAKER_PRINTER_AGENT_ID) {
+            std::vector<FilamentInfo> filaments = m_filaments;
+            const auto& diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values;
+            // A toolchanger slices filament N for extruder N, and those beyond the last extruder for the first
+            for (FilamentInfo& filament : filaments) {
+                if (!diameters.empty())
+                    filament.nozzle_diameter = filament.id < static_cast<int>(diameters.size()) ? diameters[filament.id] : diameters.front();
+            }
+            filament_result = DevMappingUtil::snapmaker_filament_mapping(obj_, filaments, m_ams_mapping_result);
+        } else {
+            filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt);
+        }
         //auto_supply_with_ext(obj_->vt_slot);
     }
 

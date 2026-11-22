@@ -517,7 +517,10 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
 
     if (update_fn)
         update_fn(PrintingStageSending, 0, _u8L("Starting print..."));
-    if (!print_uploaded_file(params, upload_filename)) {
+    std::string start_error;
+    if (!print_uploaded_file(params, upload_filename, start_error)) {
+        if (update_fn && !start_error.empty())
+            update_fn(PrintingStageERROR, BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED, start_error);
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
@@ -526,7 +529,7 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
     return BAMBU_NETWORK_SUCCESS;
 }
 
-bool MoonrakerPrinterAgent::print_uploaded_file(const PrintParams& /*params*/, const std::string& filename)
+bool MoonrakerPrinterAgent::print_uploaded_file(const PrintParams& /*params*/, const std::string& filename, std::string& /*error*/)
 {
     // Start print via gcode script (simpler than JSON-RPC); quoted so spaces and apostrophes stay part of the name
     return send_gcode_sync(device_info.dev_id, "SDCARD_PRINT_FILE FILENAME=\"" + filename + "\"");
@@ -671,6 +674,11 @@ void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index,
                 }
                 tray_json["cols"]  = cols;
                 tray_json["ctype"] = multi && tray->colors_gradient ? 0 : 1;
+
+                if (!tray->tray_sub_type.empty())
+                    tray_json["tray_sub_type"] = tray->tray_sub_type;
+                if (tray->nozzle_diameter > 0.f)
+                    tray_json["tray_nozzle_diameter"] = tray->nozzle_diameter;
 
                 // Add temperature data if provided
                 if (tray->bed_temp > 0) {
@@ -2203,6 +2211,11 @@ nlohmann::json MoonrakerPrinterAgent::build_print_payload_locked() const
         if (homed.find('Z') != std::string::npos)
             home_flag |= 4; // bit 2
     }
+    if (supports_flow_calibration()) {
+        // Like the storage state, this is read from its own key and again from home_flag (bit 16)
+        payload["print"]["support_flow_calibration"] = true;
+        home_flag |= 1 << 16;
+    }
     payload["print"]["home_flag"] = home_flag;
 
     // Moonraker doesn't provide temperature ranges via API - use hardcoded defaults
@@ -2466,6 +2479,96 @@ bool MoonrakerPrinterAgent::send_jsonrpc_command(const std::string&    base_url,
     }
 
     return success;
+}
+
+bool MoonrakerPrinterAgent::call_websocket_method(const std::string&        method,
+                                                  const nlohmann::json&     params,
+                                                  std::chrono::milliseconds timeout,
+                                                  nlohmann::json&           response) const
+{
+    WsEndpoint endpoint;
+    if (!parse_ws_endpoint(device_info.base_url, endpoint))
+        return false;
+
+    constexpr int     request_id = 1;
+    const std::string request =
+        nlohmann::json{{"jsonrpc", "2.0"}, {"method", method}, {"params", params}, {"id", request_id}}.dump();
+    const std::string api_key = device_info.api_key;
+
+    net::io_context   ioc;
+    tcp::resolver     resolver{ioc};
+    net::steady_timer deadline{ioc};
+
+    auto exchange = [&](auto& ws) {
+        auto& stream = beast::get_lowest_layer(ws);
+        auto  check  = [](const beast::error_code& ec) {
+            if (ec)
+                throw beast::system_error{ec};
+        };
+        check(connect_until_done(ioc, stream, resolver.resolve(endpoint.host, endpoint.port), std::chrono::seconds(5)));
+        stream.expires_never();
+        // One deadline for the whole call, since Moonraker's notifications keep an idle timeout from ever firing
+        deadline.expires_after(timeout);
+        deadline.async_wait([&stream](const beast::error_code& ec) {
+            beast::error_code ignored;
+            if (!ec)
+                stream.socket().close(ignored);
+        });
+
+        constexpr bool secure = !std::is_same_v<std::decay_t<decltype(ws)>, websocket::stream<beast::tcp_stream>>;
+        if constexpr (secure) {
+            beast::error_code not_address;
+            net::ip::make_address(endpoint.host, not_address);
+            if (not_address && !SSL_set_tlsext_host_name(ws.next_layer().native_handle(), endpoint.host.c_str()))
+                throw beast::system_error{beast::error_code(static_cast<int>(::ERR_get_error()), net::error::get_ssl_category())};
+            check(run_until_done(ioc, [&](auto&& done) { ws.next_layer().async_handshake(ssl::stream_base::client, done); }));
+        }
+        ws.set_option(websocket::stream_base::decorator([&api_key](websocket::request_type& upgrade) {
+            upgrade.set(http::field::user_agent, "OrcaSlicer");
+            if (!api_key.empty())
+                upgrade.set("X-Api-Key", api_key);
+        }));
+
+        std::string host_header = endpoint.host;
+        if (endpoint.port != (secure ? "443" : "80"))
+            host_header += ":" + endpoint.port;
+        check(run_until_done(ioc, [&](auto&& done) { ws.async_handshake(host_header, endpoint.target, done); }));
+        ws.text(true);
+        check(run_until_done(ioc, [&](auto&& done) { ws.async_write(net::buffer(request), done); }));
+
+        for (;;) {
+            beast::flat_buffer buffer;
+            check(run_until_done(ioc, [&](auto&& done) { ws.async_read(buffer, done); }));
+            auto message = nlohmann::json::parse(beast::buffers_to_string(buffer.data()), nullptr, false);
+            if (!message.is_object())
+                continue;
+            const auto id = message.find("id");
+            if (id != message.end() && *id == request_id) {
+                response = std::move(message);
+                break;
+            }
+        }
+        deadline.cancel();
+        beast::error_code ignored;
+        stream.socket().close(ignored);
+    };
+
+    try {
+        if (endpoint.secure) {
+            // Unverified, like the agent's other requests
+            ssl::context context{ssl::context::tls_client};
+            context.set_verify_mode(ssl::verify_none);
+            websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws{ioc, context};
+            exchange(ws);
+        } else {
+            websocket::stream<beast::tcp_stream> ws{ioc};
+            exchange(ws);
+        }
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "MoonrakerPrinterAgent: " << method << " got no answer: " << e.what();
+        return false;
+    }
+    return true;
 }
 
 void MoonrakerPrinterAgent::perform_connection_async(const std::string& dev_id, const std::string& base_url, const std::string& api_key, uint64_t generation)
