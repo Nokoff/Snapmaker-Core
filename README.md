@@ -1,3 +1,28 @@
+# Snapmaker-Core
+
+> **Unofficial and experimental.** Snapmaker-Core is a fork of [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) focused on Snapmaker U1 printing. It is not affiliated with, endorsed by or supported by Snapmaker or the OrcaSlicer project. Please don't report its problems to either of them.
+>
+> **It has not been tested on a real U1, and its new interface has not been tested in the running app.** Watch your first prints.
+
+What it adds to OrcaSlicer, ported from [Nokoff/OrcaSlicer](https://github.com/Nokoff/OrcaSlicer):
+
+- **Print and Send for the U1:** the colour-to-toolhead map, bed levelling, flow calibration and timelapse choices are sent when a print starts.
+- **Replace colour:** "Replace only" painting, and colour remapping for the selected object or the entire plate.
+- **Faster colour painting** on dense models.
+- **My Files:** a home screen tab for browsing and managing a local folder of models.
+- **Optional AVX-512 and LTO build options**, both off by default. AVX-512 was slower at slicing in testing, and an LTO build has not been completed.
+
+To use Print and Send on a U1:
+
+1. Turn on **Preferences → Use printer agents instead of print hosts**.
+2. Use U1 firmware 1.3.0 or later.
+
+There are no releases. The app still carries OrcaSlicer's name and shares its settings folder with an installed OrcaSlicer. The licence is AGPL-3.0, as for OrcaSlicer.
+
+The rest of this README is OrcaSlicer's own. Its links, downloads and community channels belong to OrcaSlicer, not to this fork.
+
+---
+
 <div align="center">
 
 <picture>
