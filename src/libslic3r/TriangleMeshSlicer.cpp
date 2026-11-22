@@ -166,9 +166,13 @@ using IntersectionLines = std::vector<IntersectionLine>;
 // nearly-collinear geometry.
 using CoplanarEdges = std::vector<bool>;
 
+// With `faces`, face_edge_ids is compact: face_edge_ids[i] belongs to face (*faces)[i].
 static CoplanarEdges coplanar_edges(const indexed_triangle_set &mesh, const std::vector<Vec3i32> &face_edge_ids,
-                                    const Transform3d &trafo)
+                                    const Transform3d &trafo, const std::vector<uint32_t> *faces = nullptr)
 {
+    auto mesh_face = [&mesh, faces](int face_idx) -> const Vec3i32& {
+        return mesh.indices[faces ? (*faces)[face_idx] : face_idx];
+    };
     struct FacePlane {
         Vec3d origin { Vec3d::Zero() };
         Vec3d normal { Vec3d::Zero() };
@@ -190,9 +194,9 @@ static CoplanarEdges coplanar_edges(const indexed_triangle_set &mesh, const std:
     };
     // Orca: Compute planes lazily. The single-plane slicer masks most faces, so eagerly calculating
     // every plane would defeat part of that optimization.
-    auto face_plane = [&mesh, &face_planes, &face_plane_computed, &transformed_vertex](int face_idx) -> const FacePlane& {
+    auto face_plane = [&mesh_face, &face_planes, &face_plane_computed, &transformed_vertex](int face_idx) -> const FacePlane& {
         if (! face_plane_computed[face_idx]) {
-            const Vec3i32 &face = mesh.indices[face_idx];
+            const Vec3i32 &face = mesh_face(face_idx);
             const Vec3d a = transformed_vertex(face(0));
             const Vec3d b = transformed_vertex(face(1));
             const Vec3d c = transformed_vertex(face(2));
@@ -221,8 +225,8 @@ static CoplanarEdges coplanar_edges(const indexed_triangle_set &mesh, const std:
                 const int first_face_idx = first_face[edge_id];
                 const FacePlane &first_plane = face_plane(first_face_idx);
                 const FacePlane &second_plane = face_plane(face_idx);
-                const int first_opposite_idx = mesh.indices[first_face_idx]((first_face_edge[edge_id] + 2) % 3);
-                const int second_opposite_idx = mesh.indices[face_idx]((edge_idx + 2) % 3);
+                const int first_opposite_idx = mesh_face(first_face_idx)((first_face_edge[edge_id] + 2) % 3);
+                const int second_opposite_idx = mesh_face(face_idx)((edge_idx + 2) % 3);
                 const Vec3d first_opposite = transformed_vertex(first_opposite_idx);
                 const Vec3d second_opposite = transformed_vertex(second_opposite_idx);
                 // Orca: A shared edge guarantees that the planes intersect, but not that they coincide.
@@ -631,6 +635,34 @@ static inline std::vector<IntersectionLines> slice_make_lines(
                            std::make_tuple(r.edge_a_id, r.edge_b_id, r.a_id, r.b_id, r.a.x(), r.a.y(), r.b.x(), r.b.y(), r.edge_type, r.flags);
                 });
         });
+    return lines;
+}
+
+// Slice only the listed faces. face_edge_ids is compact, face_edge_ids[i] belongs to faces[i].
+template<typename TransformVertex>
+static inline IntersectionLines slice_make_lines(
+    const std::vector<stl_vertex>                   &mesh_vertices,
+    const TransformVertex                           &transform_vertex_fn,
+    const std::vector<stl_triangle_vertex_indices>  &mesh_faces,
+    const std::vector<uint32_t>                     &faces,
+    const std::vector<Vec3i32>                      &face_edge_ids,
+    const float                                      plane_z)
+{
+    IntersectionLines lines;
+    for (size_t i = 0; i < faces.size(); ++ i) {
+        const Vec3i32 &indices = mesh_faces[faces[i]];
+        stl_vertex vertices[3] { transform_vertex_fn(mesh_vertices[indices(0)]), transform_vertex_fn(mesh_vertices[indices(1)]), transform_vertex_fn(mesh_vertices[indices(2)]) };
+        const float min_z = fminf(vertices[0].z(), fminf(vertices[1].z(), vertices[2].z()));
+        const float max_z = fmaxf(vertices[0].z(), fmaxf(vertices[1].z(), vertices[2].z()));
+        assert(min_z <= plane_z && max_z >= plane_z);
+        int              idx_vertex_lowest = (vertices[1].z() == min_z) ? 1 : ((vertices[2].z() == min_z) ? 2 : 0);
+        IntersectionLine il;
+        // Ignore horizontal triangles. Any valid horizontal triangle must have a vertical triangle connected, otherwise the part has zero volume.
+        if (min_z != max_z && slice_facet(plane_z, vertices, indices, face_edge_ids[i], idx_vertex_lowest, false, il) == FacetSliceType::Slicing) {
+            assert(il.edge_type != IntersectionLine::FacetEdgeType::Horizontal);
+            lines.emplace_back(il);
+        }
+    }
     return lines;
 }
 
@@ -2073,8 +2105,76 @@ std::vector<Polygons> slice_mesh(
     return layers;
 }
 
-// Specialized version for a single slicing plane only, running on a single thread.
+// Specialized version for a single slicing plane only.
 Polygons slice_mesh(
+    const indexed_triangle_set       &mesh,
+    // Unscaled Zs
+    const float                       plane_z,
+    const MeshSlicingParams          &params)
+{
+    std::vector<IntersectionLines> lines;
+    CoplanarEdges                  coplanar;
+
+    {
+        bool                  trafo_identity = is_identity(params.trafo);
+        Transform3f           tf;
+        // Faces crossing the plane, sorted ascending.
+        std::vector<uint32_t> faces;
+
+        {
+            // 1) Mark vertices as below or above the slicing plane.
+            std::vector<char> vertex_side(mesh.vertices.size(), 0);
+            if (! trafo_identity)
+                tf = make_trafo_for_slicing(params.trafo);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, mesh.vertices.size(), 4096),
+                [&mesh, &vertex_side, &tf, trafo_identity, plane_z](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++ i) {
+                        //FIXME don't need to transform x & y, just Z.
+                        float z = trafo_identity ? mesh.vertices[i].z() : (tf * mesh.vertices[i]).z();
+                        vertex_side[i] = z < plane_z ? -1 : z == plane_z ? 0 : 1;
+                    }
+                });
+
+            // 2) Mark faces crossing the plane.
+            std::vector<uint8_t> face_mask(mesh.indices.size(), 0);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, mesh.indices.size(), 4096),
+                [&mesh, &vertex_side, &face_mask](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++ i) {
+                        const Vec3i32 &face = mesh.indices[i];
+                        int sides[3] = { vertex_side[face(0)], vertex_side[face(1)], vertex_side[face(2)] };
+                        face_mask[i] = sides[0] * sides[1] <= 0 || sides[1] * sides[2] <= 0 || sides[0] * sides[2] <= 0;
+                    }
+                });
+            for (size_t i = 0; i < face_mask.size(); ++ i)
+                if (face_mask[i])
+                    faces.emplace_back(uint32_t(i));
+        }
+
+        // 3) Calculate face neighbors for just the crossing faces. Compact, indexed by position in faces.
+        std::vector<Vec3i32> face_edge_ids = its_face_edge_ids(mesh, faces);
+        // Orca: The single-plane path has its own edge-ID space, so classify that space separately.
+        coplanar = coplanar_edges(mesh, face_edge_ids, params.trafo, &faces);
+
+        // 4) Slice the crossing triangles, collect line segments.
+        // It likely is not worthwile to copy the vertices. Apply the transformation in place.
+        if (trafo_identity)
+            lines.emplace_back(slice_make_lines(
+                mesh.vertices, [](const Vec3f &p) { return Vec3f(scaled<float>(p.x()), scaled<float>(p.y()), p.z()); },
+                mesh.indices, faces, face_edge_ids, plane_z));
+        else
+            // Transform the vertices, scale up in XY, not in Z.
+            lines.emplace_back(slice_make_lines(mesh.vertices, [tf](const Vec3f& p) { return tf * p; }, mesh.indices, faces, face_edge_ids, plane_z));
+    }
+
+    // 5) Chain the line segments.
+    std::vector<Polygons> layers = make_loops(lines, coplanar, params, [](){});
+    assert(layers.size() == 1);
+    return layers.front();
+}
+
+// Original serial implementation of the single plane slice_mesh(), kept as a reference for regression tests.
+namespace detail {
+Polygons slice_mesh_single_plane_reference(
     const indexed_triangle_set       &mesh,
     // Unscaled Zs
     const float                       plane_z,
@@ -2138,6 +2238,7 @@ Polygons slice_mesh(
     assert(layers.size() == 1);
     return layers.front();
 }
+} // namespace detail
 
 std::vector<ExPolygons> slice_mesh_ex(
     const indexed_triangle_set       &mesh,

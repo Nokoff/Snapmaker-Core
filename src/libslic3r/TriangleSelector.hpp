@@ -14,6 +14,7 @@
 #include <vector>
 #include <memory>
 #include <utility>
+#include <limits>
 #include <optional>
 #include <functional>
 #include "Point.hpp"
@@ -112,11 +113,16 @@ public:
         virtual int  vertices_inside(const Triangle &tr, const std::vector<Vertex> &vertices) const;
         virtual bool is_edge_inside_cursor(const Triangle &tr, const std::vector<Vertex> &vertices) const = 0;
         virtual bool is_facet_visible(int facet_idx, const std::vector<Vec3f> &face_normals) const = 0;
+        // Longest edge, in mesh units, that triangle splitting keeps for this cursor.
+        virtual float edge_limit() const { return std::min(radius / 5.f, 0.05f); }
 
         static bool is_facet_visible(const Cursor &cursor, int facet_idx, const std::vector<Vec3f> &face_normals);
 
     protected:
         explicit Cursor(const Vec3f &source_, float radius_world, const Transform3d &trafo_, const ClippingPlane &clipping_plane_);
+
+        // Orca: brush edges are split to a tenth of the brush radius, between 0.05 mm and 0.2 mm in world units.
+        float brush_edge_limit() const { return std::clamp(radius_world / 10.f, 0.05f, 0.2f) * world_to_mesh; }
 
         Transform3f trafo;
         Vec3f       source;
@@ -125,6 +131,9 @@ public:
         Transform3f trafo_normal;
         float       radius;
         float       radius_sqr;
+        float       radius_world;
+        // Scale from world to mesh units (the average scale for non-uniform transformations).
+        float       world_to_mesh;
         Vec3f       dir = Vec3f(0.f, 0.f, 0.f);
 
         ClippingPlane clipping_plane; // Clipping plane to limit painting to not clipped facets only
@@ -194,6 +203,7 @@ public:
 
         bool is_mesh_point_inside(const Vec3f &point) const override;
         bool is_edge_inside_cursor(const Triangle &tr, const std::vector<Vertex> &vertices) const override;
+        float edge_limit() const override { return brush_edge_limit(); }
         bool is_facet_visible(int facet_idx, const std::vector<Vec3f> &face_normals) const override { return true; }
     };
 
@@ -207,6 +217,7 @@ public:
 
         bool is_mesh_point_inside(const Vec3f &point) const override;
         bool is_edge_inside_cursor(const Triangle &tr, const std::vector<Vertex> &vertices) const override;
+        float edge_limit() const override { return brush_edge_limit(); }
         bool is_facet_visible(int facet_idx, const std::vector<Vec3f> &face_normals) const override
         {
             return TriangleSelector::Cursor::is_facet_visible(*this, facet_idx, face_normals);
@@ -226,6 +237,7 @@ public:
         bool is_pointer_in_triangle(const Vec3f& p1, const Vec3f& p2, const Vec3f& p3) const override;
         bool is_mesh_point_inside(const Vec3f& point) const override;
         bool is_edge_inside_cursor(const Triangle& tr, const std::vector<Vertex>& vertices) const override;
+        float edge_limit() const override { return 0.1f; }
         bool is_facet_visible(int facet_idx, const std::vector<Vec3f>& face_normals) const override
         {
             return true;
@@ -246,6 +258,7 @@ public:
 
         bool is_mesh_point_inside(const Vec3f &point) const override;
         bool is_edge_inside_cursor(const Triangle &tr, const std::vector<Vertex> &vertices) const override;
+        float edge_limit() const override { return brush_edge_limit(); }
         bool is_facet_visible(int facet_idx, const std::vector<Vec3f> &face_normals) const override { return true; }
     };
 
@@ -260,6 +273,7 @@ public:
 
         bool is_mesh_point_inside(const Vec3f &point) const override;
         bool is_edge_inside_cursor(const Triangle &tr, const std::vector<Vertex> &vertices) const override;
+        float edge_limit() const override { return brush_edge_limit(); }
         bool is_facet_visible(int facet_idx, const std::vector<Vec3f> &face_normals) const override
         {
             return TriangleSelector::Cursor::is_facet_visible(*this, facet_idx, face_normals);
@@ -325,10 +339,52 @@ public:
 
     private:
         friend class cereal::access;
-        template<class Archive> void serialize(Archive &ar) { ar(triangles_to_split, bitstream, used_states); }
+        // Orca: cereal stores a std::vector<bool> one byte and one call per bit, and a vector of structs one element at
+        // a time. The undo stack stores this data on every paint stroke, so both are stored as plain integer arrays,
+        // which cereal copies in bulk. This format only lives in memory (undo stack).
+        static std::vector<uint64_t> pack_bits(const std::vector<bool> &bits)
+        {
+            std::vector<uint64_t> words((bits.size() + 63) / 64, 0);
+            for (size_t i = 0; i < bits.size(); ++i)
+                if (bits[i])
+                    words[i / 64] |= uint64_t(1) << (i % 64);
+            return words;
+        }
+        static void unpack_bits(const std::vector<uint64_t> &words, uint64_t num_bits, std::vector<bool> &bits)
+        {
+            bits.assign(num_bits, false);
+            for (size_t i = 0; i < num_bits; ++i)
+                if ((words[i / 64] >> (i % 64)) & 1)
+                    bits[i] = true;
+        }
+        template<class Archive> void save(Archive &ar) const
+        {
+            std::vector<int32_t> mapping;
+            mapping.reserve(2 * triangles_to_split.size());
+            for (const TriangleBitStreamMapping &m : triangles_to_split) {
+                mapping.push_back(m.triangle_idx);
+                mapping.push_back(m.bitstream_start_idx);
+            }
+            ar(mapping, uint64_t(bitstream.size()), pack_bits(bitstream), uint64_t(used_states.size()), pack_bits(used_states));
+        }
+        template<class Archive> void load(Archive &ar)
+        {
+            std::vector<int32_t>  mapping;
+            uint64_t              bitstream_size = 0, used_states_size = 0;
+            std::vector<uint64_t> bitstream_words, used_states_words;
+            ar(mapping, bitstream_size, bitstream_words, used_states_size, used_states_words);
+            triangles_to_split.clear();
+            triangles_to_split.reserve(mapping.size() / 2);
+            for (size_t i = 0; i + 1 < mapping.size(); i += 2)
+                triangles_to_split.emplace_back(mapping[i], mapping[i + 1]);
+            unpack_bits(bitstream_words, bitstream_size, bitstream);
+            unpack_bits(used_states_words, used_states_size, used_states);
+        }
     };
 
     std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>> precompute_all_neighbors() const;
+    // Orca: the result of precompute_all_neighbors(), cached until the topology of the split tree changes.
+    const std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>>& all_neighbors();
     void precompute_all_neighbors_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec3i32> &neighbors_out, std::vector<Vec3i32> &neighbors_normal_out) const;
 
     // Set a limit to the edge length, below which the edge will not be split by select_patch().
@@ -338,10 +394,17 @@ public:
     // Create new object on a TriangleMesh. The referenced mesh must
     // stay valid, a ptr to it is saved and used.
     explicit TriangleSelector(const TriangleMesh& mesh, float edge_limit = 0.6f);
+    virtual ~TriangleSelector() = default;
 
     // Returns the facet_idx of the unsplit triangle containing the "hit". Returns -1 if the triangle isn't found.
     [[nodiscard]] int select_unsplit_triangle(const Vec3f &hit, int facet_idx) const;
     [[nodiscard]] int select_unsplit_triangle(const Vec3f &hit, int facet_idx, const Vec3i32 &neighbors) const;
+    // Orca: is the unsplit triangle under the hit point already selected by the current seed or bucket fill?
+    [[nodiscard]] bool is_selected_by_seed_fill(const Vec3f &hit, int facet_idx) const
+    {
+        const int leaf = select_unsplit_triangle(hit, facet_idx);
+        return leaf >= 0 && m_triangles[leaf].is_selected_by_seed_fill();
+    }
 
     // Select all triangles fully inside the circle, subdivide where needed.
     void select_patch(int                       facet_start,                   // facet of the original mesh (unsplit) that the hit point belongs to
@@ -425,6 +488,9 @@ public:
     // For all triangles selected by seed fill, set new EnforcerBlockerType and remove flag indicating that triangle was selected by seed fill.
     // The operation may merge split triangles if they are being assigned the same color.
     void seed_fill_apply_on_triangles(EnforcerBlockerType new_state);
+
+    // Orca: changes whenever the seed fill selection or the triangle tree changes, so its contour can be cached.
+    uint64_t seed_fill_revision() const { return m_seed_fill_revision + m_topology_revision; }
 
     // Orca: Restrict painting to triangles that currently hold one of the given states, so that a
     // single filament can be recolored inside an area without disturbing the other filaments there.
@@ -530,6 +596,10 @@ protected:
     };
 
     void append_touching_subtriangles(int itriangle, int vertexi, int vertexj, std::vector<int>& touching_subtriangles_out) const;
+    // All unsplit triangles sharing an edge, or a part of it, with the given unsplit triangle.
+    std::vector<int> get_touching_leaf_triangles(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated) const;
+    // Same as above, replacing the contents of touching_out so that callers can reuse its storage.
+    void get_touching_leaf_triangles(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<int> &touching_out) const;
     bool verify_triangle_neighbors(const Triangle& tr, const Vec3i32& neighbors) const;
 
 
@@ -555,15 +625,40 @@ protected:
 
     std::unique_ptr<Cursor> m_cursor;
     // Zero indicates an uninitialized state.
-    float m_old_cursor_radius_sqr = 0;
 
     // Orca: states that painting is allowed to overwrite. Empty means no restriction.
     std::vector<EnforcerBlockerType> m_replace_filter;
     // Orca: may a triangle currently in this state be repainted?
     bool may_replace_state(EnforcerBlockerType state) const;
 
+    // Original triangle indices remain stable when subdivision storage is compacted.
+    // Renderers can use this notification to update only the touched part of a mesh.
+    virtual void on_triangle_painted(int /* facet_idx */) {}
+
     // Private functions:
 private:
+    // Track selected original roots, which stay valid through subdivision and compaction.
+    std::vector<int>  m_seed_fill_roots;
+    std::vector<bool> m_seed_fill_root_flags;
+    void              select_by_seed_fill(int facet_idx);
+    void              clear_seed_fill_recursive(int facet_idx);
+    void              apply_seed_fill_recursive(int facet_idx, EnforcerBlockerType new_state);
+
+    // Reuse brush traversal storage, clearing only the entries visited by a stroke.
+    std::vector<bool> m_brush_visited;
+    std::vector<int>  m_brush_queue;
+
+    // Orca: incremented whenever triangles are added, removed or renumbered, so cached neighbors know when to rebuild.
+    uint64_t                                              m_topology_revision      = 0;
+    uint64_t                                              m_all_neighbors_revision = std::numeric_limits<uint64_t>::max();
+    std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>> m_all_neighbors;
+    // Visited marks for fills: a triangle is visited when its stamp equals the current epoch, so nothing is cleared per fill.
+    std::vector<uint32_t> m_visit_stamps;
+    uint32_t              m_visit_epoch = 0;
+    uint64_t              m_seed_fill_revision = 0;
+    uint32_t              begin_visit();
+    bool                  is_visited(int facet_idx) const { return m_visit_stamps[facet_idx] == m_visit_epoch; }
+    void                  mark_visited(int facet_idx) { m_visit_stamps[facet_idx] = m_visit_epoch; }
     bool select_triangle(int facet_idx, EnforcerBlockerType type, bool triangle_splitting, bool select_partially);
     bool select_triangle_recursive(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType type, bool triangle_splitting, bool select_partially);
     void undivide_triangle(int facet_idx);

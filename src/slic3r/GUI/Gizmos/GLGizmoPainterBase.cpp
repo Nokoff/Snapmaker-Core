@@ -34,6 +34,10 @@
 #include <limits>
 #include "libslic3r/Config.hpp"
 #include <memory>
+
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_sort.h>
+#include <numeric>
 #include <optional>
 #include "slic3r/GUI/GLModel.hpp"
 #include <string>
@@ -447,25 +451,23 @@ void GLGizmoPainterBase::render_cursor_height_range(const Transform3d& trafo) co
     if (m_cut_contours.size() != volumes_count * 2) {
         m_cut_contours.resize(volumes_count * 2);
     }
+    const Camera& camera = wxGetApp().plater()->get_camera();
     m_volumes_index = 0;
     for (const ModelVolume* mv : model_object->volumes) {
-        TriangleMesh vol_mesh = mv->mesh();
+        // Orca: slice the volume's own mesh with its world transformation instead of copying and transforming it every frame.
+        Transform3d world_trafo;
         if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
-            Transform3d temp = mi->get_assemble_transformation().get_matrix() * mv->get_matrix();
-            temp.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) + mi->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
-            vol_mesh.transform(temp);
+            world_trafo = mi->get_assemble_transformation().get_matrix() * mv->get_matrix();
+            world_trafo.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) + mi->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
         }
         else {
-            vol_mesh.transform(mi->get_transformation().get_matrix() * mv->get_matrix());
+            world_trafo = mi->get_transformation().get_matrix() * mv->get_matrix();
         }
 
         for (int i = 0; i < zs.size(); i++) {
-            update_contours(m_volumes_index, vol_mesh, zs[i], max_z, min_z);
+            update_contours(m_volumes_index, *mv, world_trafo, zs[i], max_z, min_z);
 
-            const Camera& camera = wxGetApp().plater()->get_camera();
-            Transform3d view_model_matrix = camera.get_view_matrix()  * Geometry::assemble_transform(m_cut_contours[m_volumes_index].shift);
-
-            shader->set_uniform("view_model_matrix", view_model_matrix);
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
             // ORCA: OpenGL Core Profile
 #if !SLIC3R_OPENGL_ES
@@ -494,41 +496,38 @@ BoundingBoxf3 GLGizmoPainterBase::bounding_box() const
     return ret;
 }
 
-void GLGizmoPainterBase::update_contours(int i, const TriangleMesh& vol_mesh, float cursor_z, float max_z, float min_z) const
+void GLGizmoPainterBase::update_contours(int i, const ModelVolume& volume, const Transform3d& world_trafo, float cursor_z, float max_z, float min_z) const
 {
-    const Selection& selection = m_parent.get_selection();
-    const GLVolume* first_glvolume = selection.get_first_volume();
-    const BoundingBoxf3& box = first_glvolume->transformed_convex_hull_bounding_box();
+    CutContours& cut = m_cut_contours[i];
+    if (!(min_z < cursor_z && cursor_z < max_z)) {
+        cut.contours.reset();
+        cut.valid = false;
+        return;
+    }
 
-    const ModelObject* model_object = wxGetApp().model().objects[selection.get_object_idx()];
-    const int instance_idx = selection.get_instance_idx();
+    const TriangleMesh& mesh = volume.mesh();
+    if (cut.valid && cut.cut_z == cursor_z && cut.volume_id == volume.id() && cut.mesh == &mesh && cut.trafo.matrix() == world_trafo.matrix())
+        return;
 
-        if (min_z < cursor_z && cursor_z < max_z) {
-            if (m_cut_contours[i].cut_z != cursor_z || m_cut_contours[i].object_id != model_object->id() || m_cut_contours[i].instance_idx != instance_idx) {
-                m_cut_contours[i].cut_z = cursor_z;
+    cut.valid     = true;
+    cut.cut_z     = cursor_z;
+    cut.volume_id = volume.id();
+    cut.mesh      = &mesh;
+    cut.trafo     = world_trafo;
+    cut.contours.reset();
 
-                m_cut_contours[i].mesh = vol_mesh;
+    // The cached bounding box is cheap to transform and rejects volumes that the plane misses.
+    const BoundingBoxf3 bbox = mesh.bounding_box().transformed(world_trafo);
+    if (cursor_z < bbox.min.z() || cursor_z > bbox.max.z())
+        return;
 
-                m_cut_contours[i].position = box.center();
-                m_cut_contours[i].shift = Vec3d::Zero();
-                m_cut_contours[i].object_id = model_object->id();
-                m_cut_contours[i].instance_idx = instance_idx;
-                m_cut_contours[i].contours.reset();
-
-                MeshSlicingParams slicing_params;
-                slicing_params.trafo = Transform3d::Identity().matrix();
-                const Polygons polys = slice_mesh(m_cut_contours[i].mesh.its, cursor_z, slicing_params);
-                if (!polys.empty()) {
-                    m_cut_contours[i].contours.init_from(polys, static_cast<float>(cursor_z));
-                    m_cut_contours[i].contours.set_color({ 1.0f, 1.0f, 1.0f, 1.0f });
-                }
-            }
-            else if (box.center() != m_cut_contours[i].position) {
-                m_cut_contours[i].shift = box.center() - m_cut_contours[i].position;
-            }
-        }
-        else
-            m_cut_contours[i].contours.reset();
+    MeshSlicingParams slicing_params;
+    slicing_params.trafo = world_trafo;
+    const Polygons polys = slice_mesh(mesh.its, cursor_z, slicing_params);
+    if (!polys.empty()) {
+        cut.contours.init_from(polys, static_cast<float>(cursor_z));
+        cut.contours.set_color({ 1.0f, 1.0f, 1.0f, 1.0f });
+    }
 }
 
 bool GLGizmoPainterBase::is_mesh_point_clipped(const Vec3d& point, const Transform3d& trafo) const
@@ -619,6 +618,7 @@ std::vector<std::vector<GLGizmoPainterBase::ProjectedMousePosition>> GLGizmoPain
         return std::nullopt;
     };
 
+    const std::vector<const MeshRaycaster*> raycasters = m_c->raycaster()->raycasters();
     for(std::vector<ProjectedMousePosition> &hit_points : mesh_hit_points_by_mesh) {
         assert(!hit_points.empty());
         if (hit_points.back().mesh_idx == -1)
@@ -640,9 +640,12 @@ std::vector<std::vector<GLGizmoPainterBase::ProjectedMousePosition>> GLGizmoPain
                 polyline.points.emplace_back(scale_(x_cord), scale_(y_cord));
             }
 
-            polyline.simplify(scale_(m_cursor_radius) / 10.);
+            // The hit points are in mesh coordinates, so is the simplification tolerance.
+            const int    mesh_idx      = hit_points.front().mesh_idx;
+            const Vec3d  scaling       = Geometry::Transformation(trafo_matrices[mesh_idx]).get_scaling_factor();
+            const double mesh_radius   = double(m_cursor_radius) * 3. / (scaling.x() + scaling.y() + scaling.z());
+            polyline.simplify(scale_(mesh_radius) / 10.);
 
-            const int                           mesh_idx = hit_points.front().mesh_idx;
             std::vector<ProjectedMousePosition> new_hit_points;
             new_hit_points.reserve(polyline.points.size());
             // Project 2D simplified hit_points beck to 3D.
@@ -650,7 +653,7 @@ std::vector<std::vector<GLGizmoPainterBase::ProjectedMousePosition>> GLGizmoPain
                 const double x_cord        = unscale<double>(point.x());
                 const double y_cord        = unscale<double>(point.y());
                 const Vec3d  new_hit_point = plane->origin + x_cord * plane->first_axis + y_cord * plane->second_axis;
-                const int    facet_idx     = m_c->raycaster()->raycasters()[mesh_idx]->get_closest_facet(new_hit_point.cast<float>());
+                const int    facet_idx     = raycasters[mesh_idx]->get_closest_facet(new_hit_point.cast<float>());
                 new_hit_points.push_back({new_hit_point.cast<float>(), mesh_idx, size_t(facet_idx)});
             }
 
@@ -700,6 +703,11 @@ std::vector<GLGizmoPainterBase::ProjectedHeightRange> GLGizmoPainterBase::get_pr
 
         const Transform3d& trafo = trafo_matrices[mesh_idx];
         const indexed_triangle_set& its = part_volumes[mesh_idx]->mesh().its;
+
+        // Orca: skip the facet scan for volumes whose bounding box misses the band.
+        const BoundingBoxf3 bbox = part_volumes[mesh_idx]->mesh().bounding_box().transformed(trafo);
+        if (bbox.max.z() < z_bot_world || bbox.min.z() > z_top_world)
+            continue;
 
         int first_hit_facet_idx = -1;
         for (int facet_idx = 0; facet_idx < its.indices.size(); facet_idx++) {
@@ -884,7 +892,7 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                 m_triangle_selectors[mesh_idx]->select_patch(int(phr.first_facet_idx), std::move(cursor), new_state, trafo_matrix_not_translate,
                     m_triangle_splitting_enabled, m_paint_on_overhangs_only ? get_highlight_angle_limit_deg() : 0.f, get_tilt_up_direction());
 
-                m_triangle_selectors[mesh_idx]->request_update_render_data(true);
+                m_triangle_selectors[mesh_idx]->request_update_render_data(true, false);
                 m_last_mouse_click = _mouse_position;
             }
 
@@ -898,7 +906,13 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                 _mouse_position.y() = m_last_mouse_click.y();
         }
         
-        std::vector<std::vector<ProjectedMousePosition>> projected_mouse_positions_by_mesh = get_projected_mouse_positions(_mouse_position, 1., trafo_matrices);
+        // Orca: sphere and circle brushes join consecutive samples with a capsule, so samples a quarter of the brush
+        // radius apart leave no gaps. The pointer and the fill tools act on the triangle under each sample, and keep
+        // one sample per pixel.
+        double sample_spacing = 1.;
+        if (m_tool_type == ToolType::BRUSH && (m_cursor_type == TriangleSelector::CursorType::SPHERE || m_cursor_type == TriangleSelector::CursorType::CIRCLE))
+            sample_spacing = std::clamp(double(m_cursor_radius) * camera.get_zoom() / 4., 1., 16.);
+        std::vector<std::vector<ProjectedMousePosition>> projected_mouse_positions_by_mesh = get_projected_mouse_positions(_mouse_position, sample_spacing, trafo_matrices);
         m_last_mouse_click = Vec2d::Zero(); // only actual hits should be saved
 
         for (const std::vector<ProjectedMousePosition> &projected_mouse_positions : projected_mouse_positions_by_mesh) {
@@ -910,8 +924,10 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
             // Missing the object entirely
             // shall not capture the mouse.
             if (mesh_idx != -1)
-                if (m_button_down == Button::None)
+                if (m_button_down == Button::None) {
                     m_button_down = ((action == SLAGizmoEventType::LeftDown) ? Button::Left : Button::Right);
+                    m_applied_seed_fill_revisions.clear();
+                }
 
             // In case we have no valid hit, we can return. The event will be stopped when
             // dragging while painting (to prevent scene rotations and moving the object)
@@ -932,7 +948,18 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                     assert(projected_mouse_position.mesh_idx == mesh_idx);
                     const Vec3f mesh_hit = projected_mouse_position.mesh_hit;
                     const int facet_idx = int(projected_mouse_position.facet_idx);
-                    m_triangle_selectors[mesh_idx]->seed_fill_apply_on_triangles(new_state);
+                    // Orca: during a stroke only this loop changes the selection, so a selection that was applied
+                    // already and has not changed since would only be painted again with the same state.
+                    if (m_applied_seed_fill_revisions.size() <= size_t(mesh_idx))
+                        m_applied_seed_fill_revisions.resize(mesh_idx + 1, std::numeric_limits<uint64_t>::max());
+                    if (m_applied_seed_fill_revisions[mesh_idx] != m_triangle_selectors[mesh_idx]->seed_fill_revision()) {
+                        m_triangle_selectors[mesh_idx]->seed_fill_apply_on_triangles(new_state);
+                        m_applied_seed_fill_revisions[mesh_idx] = m_triangle_selectors[mesh_idx]->seed_fill_revision();
+                    }
+                    // A sample inside the region that was just painted would select and repaint the same region,
+                    // so skip the whole-region search for it. Only samples that reach a new region pay for one.
+                    if (m_triangle_selectors[mesh_idx]->is_selected_by_seed_fill(mesh_hit, facet_idx))
+                        continue;
                     if (m_tool_type == ToolType::SMART_FILL)
                         m_triangle_selectors[mesh_idx]->seed_fill_select_triangles(mesh_hit, facet_idx, trafo_matrix_not_translate, clp, m_smart_fill_angle,
                                                                                        m_paint_on_overhangs_only ? get_highlight_angle_limit_deg() : 0.f, get_tilt_up_direction(), true);
@@ -964,7 +991,7 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                 }
             }
 
-            m_triangle_selectors[mesh_idx]->request_update_render_data(true);
+            m_triangle_selectors[mesh_idx]->request_update_render_data(true, false);
 
             m_last_mouse_click = _mouse_position;
         }
@@ -1410,11 +1437,13 @@ float TriangleSelectorPatch::gap_area = TriangleSelectorPatch::GapAreaMin;
 
 void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matrix)
 {
-    static bool last_show_wireframe = false;
-    if (last_show_wireframe != wxGetApp().plater()->is_show_wireframe()) {
-        last_show_wireframe  = wxGetApp().plater()->is_show_wireframe();
+    const bool using_wireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
+                                 wxGetApp().plater()->is_show_wireframe();
+    if (m_render_wireframe != using_wireframe) {
+        m_render_wireframe   = using_wireframe;
         m_update_render_data = true;
         m_paint_changed      = true;
+        m_full_paint_update  = true;
     }
     if (m_update_render_data) {
         update_render_data();
@@ -1438,77 +1467,154 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
         }
     }
 
-    for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
-        if (this->has_VBOs(buffer_idx)) {
-            const TrianglePatch& patch = m_triangle_patches[buffer_idx];
-            ColorRGBA color;
-            if (patch.is_fragment() && !patch.neighbor_types.empty()) {
-                size_t color_idx = (size_t)*patch.neighbor_types.begin();
-                color = m_ebt_colors[color_idx];
-                color.a(0.85);
+    if (!m_filter_state) {
+        // Draw chunks of the same color together, setting the shader color once.
+        for (size_t state = 0; state < m_ebt_colors.size(); ++state) {
+            bool color_set = false;
+            for (size_t buffer_idx = state; buffer_idx < m_triangle_patches.size(); buffer_idx += m_ebt_colors.size()) {
+                if (!has_VBOs(buffer_idx))
+                    continue;
+                if (!color_set) {
+                    shader->set_uniform("uniform_color", adjust_color_for_rendering(m_ebt_colors[state]));
+                    color_set = true;
+                }
+                render(int(buffer_idx), show_wireframe);
             }
-            else {
-                size_t color_idx = (size_t)patch.type;
-                color = m_ebt_colors[color_idx];
-            }
-            //to make black not too hard too see
-            ColorRGBA new_color = adjust_color_for_rendering(color);
-            shader->set_uniform("uniform_color", new_color);
-            this->render(buffer_idx, show_wireframe);
         }
-    }
+    } else
+        for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
+            if (this->has_VBOs(buffer_idx)) {
+                const TrianglePatch& patch = m_triangle_patches[buffer_idx];
+                ColorRGBA            color;
+                if (patch.is_fragment() && !patch.neighbor_types.empty()) {
+                    size_t color_idx = (size_t) *patch.neighbor_types.begin();
+                    if (color_idx >= m_ebt_colors.size())
+                        continue;
+                    color = m_ebt_colors[color_idx];
+                    color.a(0.85);
+                } else {
+                    size_t color_idx = (size_t) patch.type;
+                    if (color_idx >= m_ebt_colors.size())
+                        continue;
+                    color = m_ebt_colors[color_idx];
+                }
+                // to make black not too hard too see
+                ColorRGBA new_color = adjust_color_for_rendering(color);
+                shader->set_uniform("uniform_color", new_color);
+                this->render(buffer_idx, show_wireframe);
+            }
+        }
 
     render_paint_contour(matrix);
 }
 
+size_t TriangleSelectorPatch::render_chunk_count() const { return (size_t(m_orig_size_indices) + RENDER_CHUNK_SIZE - 1) / RENDER_CHUNK_SIZE; }
+
+// Orca: group the original facets into chunks of nearby facets, so that a brush stroke dirties only the few chunks under
+// the brush, even when the facet order of the mesh is scattered. Facets are ordered along a Morton curve of their centroids.
+void TriangleSelectorPatch::build_render_chunks()
+{
+    if (m_facet_chunks.size() == size_t(m_orig_size_indices))
+        return;
+
+    BoundingBoxf3 bbox;
+    std::vector<Vec3f> centroids(m_orig_size_indices);
+    for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx) {
+        const Triangle& tr = m_triangles[facet_idx];
+        centroids[facet_idx] = (m_vertices[tr.verts_idxs[0]].v + m_vertices[tr.verts_idxs[1]].v + m_vertices[tr.verts_idxs[2]].v) / 3.f;
+        bbox.merge(centroids[facet_idx].cast<double>());
+    }
+    const Vec3d size  = bbox.size();
+    const Vec3d scale = Vec3d(size.x() > 0. ? 1023. / size.x() : 0., size.y() > 0. ? 1023. / size.y() : 0., size.z() > 0. ? 1023. / size.z() : 0.);
+    // Spread the lowest 10 bits of v so that two zero bits follow each of them.
+    const auto spread_bits = [](uint32_t v) {
+        v = (v | (v << 16)) & 0x030000FF;
+        v = (v | (v << 8)) & 0x0300F00F;
+        v = (v | (v << 4)) & 0x030C30C3;
+        v = (v | (v << 2)) & 0x09249249;
+        return v;
+    };
+    std::vector<std::pair<uint32_t, int>> order(m_orig_size_indices);
+    tbb::parallel_for(tbb::blocked_range<int>(0, m_orig_size_indices, 4096), [&](const tbb::blocked_range<int>& range) {
+        for (int facet_idx = range.begin(); facet_idx < range.end(); ++facet_idx) {
+            const Vec3d c = (centroids[facet_idx].cast<double>() - bbox.min).cwiseProduct(scale);
+            order[facet_idx] = { spread_bits(uint32_t(c.x())) | (spread_bits(uint32_t(c.y())) << 1) | (spread_bits(uint32_t(c.z())) << 2), facet_idx };
+        }
+    });
+    // Ties are broken by the facet index, so the chunks do not depend on the thread count.
+    tbb::parallel_sort(order.begin(), order.end());
+
+    const size_t chunk_count = render_chunk_count();
+    m_facet_chunks.assign(m_orig_size_indices, 0);
+    m_chunk_facets.assign(chunk_count, {});
+    for (size_t rank = 0; rank < order.size(); ++rank) {
+        const size_t chunk_idx = rank / RENDER_CHUNK_SIZE;
+        m_facet_chunks[order[rank].second] = uint32_t(chunk_idx);
+        m_chunk_facets[chunk_idx].push_back(order[rank].second);
+    }
+    // Walk the facets of a chunk in memory order.
+    for (std::vector<int>& facets : m_chunk_facets)
+        std::sort(facets.begin(), facets.end());
+}
+
 void TriangleSelectorPatch::update_triangles_per_type()
 {
-    //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", enter");
-    m_triangle_patches.resize((int)EnforcerBlockerType::ExtruderMax + 1);
-    for (int i = 0; i < m_triangle_patches.size(); i++) {
-        auto& patch = m_triangle_patches[i];
-        patch.type = (EnforcerBlockerType)i;
-        patch.triangle_indices.reserve(m_triangles.size() / 3);
+    build_render_chunks();
+    const size_t chunk_count = render_chunk_count();
+    m_triangle_patches.resize(chunk_count * m_ebt_colors.size());
+    m_dirty_render_chunks.assign(chunk_count, false);
+    // The chunks only read the triangle tree and write their own patches, so they are built in parallel.
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, chunk_count, 1), [this](const tbb::blocked_range<size_t>& range) {
+        for (size_t chunk_idx = range.begin(); chunk_idx < range.end(); ++chunk_idx)
+            update_render_chunk(chunk_idx);
+    });
+}
+
+void TriangleSelectorPatch::on_triangle_painted(int facet_idx)
+{
+    build_render_chunks();
+    const size_t chunk_idx = m_facet_chunks[facet_idx];
+    m_dirty_render_chunks.resize(render_chunk_count(), false);
+    if (!m_dirty_render_chunks[chunk_idx]) {
+        m_dirty_render_chunks[chunk_idx] = true;
+        m_dirty_render_chunk_indices.push_back(chunk_idx);
+    }
+}
+
+void TriangleSelectorPatch::update_render_chunk(size_t chunk_idx)
+{
+    const size_t patch_offset = chunk_idx * m_ebt_colors.size();
+    for (size_t state = 0; state < m_ebt_colors.size(); ++state) {
+        TrianglePatch& patch = m_triangle_patches[patch_offset + state];
+        patch.type           = static_cast<EnforcerBlockerType>(state);
+        patch.vertex_stride  = m_render_wireframe ? 6 : 3;
+        patch.patch_vertices.clear();
+    }
+    for (int facet_idx : m_chunk_facets[chunk_idx])
+        append_triangle_to_patch(facet_idx, patch_offset);
+}
+
+void TriangleSelectorPatch::append_triangle_to_patch(int facet_idx, size_t patch_offset)
+{
+    const Triangle& triangle = m_triangles[facet_idx];
+    if (!triangle.valid())
+        return;
+    if (triangle.is_split()) {
+        for (int child_idx = 0; child_idx <= triangle.number_of_split_sides(); ++child_idx)
+            append_triangle_to_patch(triangle.children[child_idx], patch_offset);
+        return;
     }
 
-    bool using_wireframe = (m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() && wxGetApp().plater()->is_show_wireframe()) ? true : false;
-
-    for (auto& triangle : m_triangles) {
-        if (!triangle.valid() || triangle.is_split())
-            continue;
-
-        int state = (int)triangle.get_state();
-        auto& patch = m_triangle_patches[state];
-        //patch.triangle_indices.insert(patch.triangle_indices.end(), triangle.verts_idxs.begin(), triangle.verts_idxs.end());
-        for (int i = 0; i < 3; ++i) {
-            int j = triangle.verts_idxs[i];
-            int index = using_wireframe?int(patch.patch_vertices.size()/6) : int(patch.patch_vertices.size()/3);
-            //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: i=%2%, j=%3%, index=%4%, v[%5%,%6%,%7%]")%__LINE__%i%j%index%m_vertices[j].v(0)%m_vertices[j].v(1)%m_vertices[j].v(2);
-            patch.patch_vertices.emplace_back(m_vertices[j].v(0));
-            patch.patch_vertices.emplace_back(m_vertices[j].v(1));
-            patch.patch_vertices.emplace_back(m_vertices[j].v(2));
-            if (using_wireframe) {
-                if (i == 0) {
-                    patch.patch_vertices.emplace_back(1.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                }
-                else if (i == 1) {
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(1.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                }
-                else {
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(1.0);
-                }
-            }
-            patch.triangle_indices.emplace_back( index);
-        }
-        //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: state=%2%, vertice size=%3%, triangle size %4%")%__LINE__%state%patch.patch_vertices.size()%patch.triangle_indices.size();
+    const size_t state = static_cast<size_t>(triangle.get_state());
+    if (state >= m_ebt_colors.size())
+        return;
+    TrianglePatch& patch  = m_triangle_patches[patch_offset + state];
+    for (int i = 0; i < 3; ++i) {
+        const Vec3f& vertex = m_vertices[triangle.verts_idxs[i]].v;
+        patch.patch_vertices.insert(patch.patch_vertices.end(), {vertex.x(), vertex.y(), vertex.z()});
+        if (m_render_wireframe)
+            patch.patch_vertices.insert(patch.patch_vertices.end(), {i == 0 ? 1.f : 0.f, i == 1 ? 1.f : 0.f, i == 2 ? 1.f : 0.f});
     }
-    //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("exit");
 }
 
 void TriangleSelectorPatch::update_selector_triangles()
@@ -1527,41 +1633,20 @@ void TriangleSelectorPatch::update_selector_triangles()
 
 void TriangleSelectorPatch::update_triangles_per_patch()
 {
-    auto [neighbors, neighbors_propagated] = this->precompute_all_neighbors();
+    const auto& [neighbors, neighbors_propagated] = this->all_neighbors();
     std::vector<bool>  visited(m_triangles.size(), false);
+    std::vector<int>   touching_triangles;
 
     bool using_wireframe = (m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() && wxGetApp().plater()->is_show_wireframe()) ? true : false; 
 
-    auto get_all_touching_triangles = [this](int facet_idx, const Vec3i32& neighbors, const Vec3i32& neighbors_propagated) -> std::vector<int> {
-        assert(facet_idx != -1 && facet_idx < int(m_triangles.size()));
-        assert(this->verify_triangle_neighbors(m_triangles[facet_idx], neighbors));
-        std::vector<int> touching_triangles;
-        Vec3i32            vertices = { m_triangles[facet_idx].verts_idxs[0], m_triangles[facet_idx].verts_idxs[1], m_triangles[facet_idx].verts_idxs[2] };
-        append_touching_subtriangles(neighbors(0), vertices(1), vertices(0), touching_triangles);
-        append_touching_subtriangles(neighbors(1), vertices(2), vertices(1), touching_triangles);
-        append_touching_subtriangles(neighbors(2), vertices(0), vertices(2), touching_triangles);
-
-        for (int neighbor_idx : neighbors_propagated)
-            if (neighbor_idx != -1 && !m_triangles[neighbor_idx].is_split())
-                touching_triangles.emplace_back(neighbor_idx);
-
-        return touching_triangles;
-    };
-
     auto calc_fragment_area = [](const TrianglePatch& patch, float max_limit_area, int stride) {
         double total_area = 0.f;
-        const std::vector<int>& ti = patch.triangle_indices;
-        /*for (int i = 0; i < ti.size() / 3; i++) {
-            total_area += std::abs((m_vertices[ti[i]].v - m_vertices[ti[i + 1]].v)
-                .cross(m_vertices[ti[i]].v - m_vertices[ti[i + 2]].v).norm()) / 2;
-            if (total_area >= max_limit_area)
-                break;
-        }*/
+        // Each triangle has its own three vertices, stored one after another.
         const std::vector<float>& vertices = patch.patch_vertices;
-        for (int i = 0; i < ti.size(); i+=3) {
-            stl_vertex v0(vertices[ti[i] * stride], vertices[ti[i] * stride + 1], vertices[ti[i] * stride + 2]);
-            stl_vertex v1(vertices[ti[i + 1] * stride], vertices[ti[i + 1] * stride + 1], vertices[ti[i + 1] * stride + 2]);
-            stl_vertex v2(vertices[ti[i + 2] * stride], vertices[ti[i + 2] * stride + 1], vertices[ti[i + 2] * stride + 2]);
+        for (size_t i = 0; i + 3 * stride <= vertices.size(); i += 3 * stride) {
+            stl_vertex v0(vertices[i], vertices[i + 1], vertices[i + 2]);
+            stl_vertex v1(vertices[i + stride], vertices[i + stride + 1], vertices[i + stride + 2]);
+            stl_vertex v2(vertices[i + 2 * stride], vertices[i + 2 * stride + 1], vertices[i + 2 * stride + 2]);
             total_area += std::abs((v0 - v1).cross(v0 - v2).norm()) / 2;
             if (total_area >= max_limit_area)
                 break;
@@ -1593,7 +1678,6 @@ void TriangleSelectorPatch::update_triangles_per_patch()
                 Triangle& triangle = m_triangles[current_facet];
                 for (int i = 0; i < 3; ++i) {
                     int j = triangle.verts_idxs[i];
-                    int index = using_wireframe?int(patch.patch_vertices.size()/6) : int(patch.patch_vertices.size()/3);
                     patch.patch_vertices.emplace_back(m_vertices[j].v(0));
                     patch.patch_vertices.emplace_back(m_vertices[j].v(1));
                     patch.patch_vertices.emplace_back(m_vertices[j].v(2));
@@ -1614,12 +1698,10 @@ void TriangleSelectorPatch::update_triangles_per_patch()
                             patch.patch_vertices.emplace_back(1.0);
                         }
                     }
-                    patch.triangle_indices.emplace_back( index);
                 }
-                //patch.triangle_indices.insert(patch.triangle_indices.end(), triangle.verts_idxs.begin(), triangle.verts_idxs.end());
                 patch.facet_indices.push_back(current_facet);
 
-                std::vector<int> touching_triangles = get_all_touching_triangles(current_facet, neighbors[current_facet], neighbors_propagated[current_facet]);
+                this->get_touching_leaf_triangles(current_facet, neighbors[current_facet], neighbors_propagated[current_facet], touching_triangles);
                 for (const int tr_idx : touching_triangles) {
                     if (tr_idx < 0)
                         continue;
@@ -1641,7 +1723,8 @@ void TriangleSelectorPatch::update_triangles_per_patch()
             visited[current_facet] = true;
         }
 
-        patch.area = calc_fragment_area(patch, GapAreaMax, using_wireframe?6:3);
+        patch.vertex_stride = using_wireframe ? 6 : 3;
+        patch.area = calc_fragment_area(patch, GapAreaMax, patch.vertex_stride);
         patch.type = start_facet_state;
         m_triangle_patches.emplace_back(std::move(patch));
      }
@@ -1649,9 +1732,10 @@ void TriangleSelectorPatch::update_triangles_per_patch()
 
 void TriangleSelectorPatch::set_filter_state(bool is_filter_state)
 {
-    if (!m_filter_state && is_filter_state) {
+    if (m_filter_state != is_filter_state) {
         m_filter_state = is_filter_state;
-        this->release_geometry();
+        m_paint_changed     = true;
+        m_full_paint_update = true;
         update_render_data();
     }
 
@@ -1660,25 +1744,31 @@ void TriangleSelectorPatch::set_filter_state(bool is_filter_state)
 
 void TriangleSelectorPatch::update_render_data()
 {
-    //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", m_paint_changed=%1%, m_triangle_patches.size %2%")%m_paint_changed%m_triangle_patches.size();
     if (m_paint_changed || (m_triangle_patches.size() == 0)) {
-        this->release_geometry();
-
-        /*m_patch_vertices.reserve(m_vertices.size() * 3);
-        for (const Vertex& vr : m_vertices) {
-            m_patch_vertices.emplace_back(vr.v.x());
-            m_patch_vertices.emplace_back(vr.v.y());
-            m_patch_vertices.emplace_back(vr.v.z());
+        const size_t chunk_count = render_chunk_count();
+        if (m_full_paint_update || m_filter_state || m_triangle_patches.size() != chunk_count * m_ebt_colors.size()) {
+            release_geometry();
+            if (m_filter_state)
+                update_triangles_per_patch();
+            else
+                update_triangles_per_type();
+            finalize_triangle_indices();
+        } else {
+            // Build the dirty chunks in parallel, then upload them on this thread, which owns the OpenGL context.
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, m_dirty_render_chunk_indices.size(), 1), [this](const tbb::blocked_range<size_t>& range) {
+                for (size_t i = range.begin(); i < range.end(); ++i)
+                    update_render_chunk(m_dirty_render_chunk_indices[i]);
+            });
+            for (size_t chunk_idx : m_dirty_render_chunk_indices) {
+                const size_t first_patch = chunk_idx * m_ebt_colors.size();
+                finalize_triangle_indices(first_patch, first_patch + m_ebt_colors.size());
+                m_dirty_render_chunks[chunk_idx] = false;
+            }
         }
-        this->finalize_vertices();*/
+        m_dirty_render_chunk_indices.clear();
 
-        if (m_filter_state)
-            update_triangles_per_patch();
-        else
-            update_triangles_per_type();
-        this->finalize_triangle_indices();
-
-        m_paint_changed = false;
+        m_paint_changed     = false;
+        m_full_paint_update = false;
     }
 
     //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", before paint_contour");
@@ -1688,8 +1778,7 @@ void TriangleSelectorPatch::update_render_data()
 
 void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe)
 {
-    assert(triangle_indices_idx < this->m_triangle_indices_VBO_ids.size());
-    assert(this->m_triangle_patches.size() == this->m_triangle_indices_VBO_ids.size());
+    assert(triangle_indices_idx < this->m_vertices_VBO_ids.size());
 #if !SLIC3R_OPENGL_ES
     if (OpenGLManager::get_gl_info().is_core_profile()) {
 #endif // !SLIC3R_OPENGL_ES
@@ -1700,7 +1789,6 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
     //assert(this->m_vertices_VBO_id != 0);
     assert(this->m_triangle_patches.size() == this->m_vertices_VBO_ids.size());
     assert(this->m_vertices_VBO_ids[triangle_indices_idx] != 0);
-    assert(this->m_triangle_indices_VBO_ids[triangle_indices_idx] != 0);
 
     GLShaderProgram *shader = wxGetApp().get_current_shader();
     if (shader == nullptr)
@@ -1729,17 +1817,20 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
     /*if (show_wireframe)*/ {
         barycentric_id = shader->get_attrib_location("v_barycentric");
         if (barycentric_id != -1) {
-            glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) (3 * sizeof(float))));
+            // Without wireframe the buffer holds positions only. Point the attribute at them, so it stays enabled
+            // (AMD needs that) without reading past the end of the buffer. The shader ignores it then.
+            if (show_wireframe)
+                glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) (3 * sizeof(float))));
+            else
+                glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr));
             glsafe(::glEnableVertexAttribArray((GLint) barycentric_id));
         }
     }
 
     // Render using the Vertex Buffer Objects.
-    if (this->m_triangle_indices_sizes[triangle_indices_idx] > 0) {
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, this->m_triangle_indices_VBO_ids[triangle_indices_idx]));
-        glsafe(::glDrawElements(GL_TRIANGLES, GLsizei(this->m_triangle_indices_sizes[triangle_indices_idx]), GL_UNSIGNED_INT, nullptr));
-        glsafe(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-        //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: triangle_indices_idx %2%, bind indices vbo, buffer id %3%")%__LINE__%triangle_indices_idx%this->m_triangle_indices_VBO_ids[triangle_indices_idx];
+    // Every triangle has its own three vertices, so they are drawn in order without an index buffer.
+    if (this->m_vertex_counts[triangle_indices_idx] > 0) {
+        glsafe(::glDrawArrays(GL_TRIANGLES, 0, GLsizei(this->m_vertex_counts[triangle_indices_idx])));
     }
 
     if (position_id != -1)
@@ -1770,10 +1861,6 @@ void TriangleSelectorPatch::release_geometry()
         glsafe(::glDeleteBuffers(1, &vertice_VBO_id));
         vertice_VBO_id = 0;
     }
-    for (auto& triangle_indices_VBO_id : m_triangle_indices_VBO_ids) {
-        glsafe(::glDeleteBuffers(1, &triangle_indices_VBO_id));
-        triangle_indices_VBO_id = 0;
-    }
     this->clear();
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: released geometry")%__LINE__;
@@ -1791,7 +1878,9 @@ void TriangleSelectorPatch::finalize_vertices()
     }*/
 }
 
-void TriangleSelectorPatch::finalize_triangle_indices()
+void TriangleSelectorPatch::finalize_triangle_indices() { finalize_triangle_indices(0, m_triangle_patches.size()); }
+
+void TriangleSelectorPatch::finalize_triangle_indices(size_t first, size_t last)
 {
 #if !SLIC3R_OPENGL_ES
     if (OpenGLManager::get_gl_info().is_core_profile()) {
@@ -1801,31 +1890,28 @@ void TriangleSelectorPatch::finalize_triangle_indices()
     }
 #endif // !SLIC3R_OPENGL_ES
     m_vertices_VBO_ids.resize(m_triangle_patches.size());
-    m_triangle_indices_VBO_ids.resize(m_triangle_patches.size());
-    m_triangle_indices_sizes.resize(m_triangle_patches.size());
-    assert(std::all_of(m_triangle_indices_VBO_ids.cbegin(), m_triangle_indices_VBO_ids.cend(), [](const auto& ti_VBO_id) { return ti_VBO_id == 0; }));
+    m_vertex_counts.resize(m_triangle_patches.size());
 
-    for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
-        std::vector<float>& patch_vertices = m_triangle_patches[buffer_idx].patch_vertices;
-        if (!patch_vertices.empty()) {
+    for (size_t buffer_idx = first; buffer_idx < last; ++buffer_idx) {
+        TrianglePatch&      patch          = m_triangle_patches[buffer_idx];
+        std::vector<float>& patch_vertices = patch.patch_vertices;
+        m_vertex_counts[buffer_idx]        = patch_vertices.size() / patch.vertex_stride;
+        if (patch_vertices.empty()) {
+            // Repainting a complete chunk can empty a color's buffer. Release it
+            // so repeated color changes do not retain a mesh per previous color.
+            if (m_vertices_VBO_ids[buffer_idx] != 0) {
+                glsafe(::glDeleteBuffers(1, &m_vertices_VBO_ids[buffer_idx]));
+                m_vertices_VBO_ids[buffer_idx] = 0;
+            }
+            std::vector<float>().swap(patch_vertices);
+            continue;
+        }
+        if (m_vertices_VBO_ids[buffer_idx] == 0)
             glsafe(::glGenBuffers(1, &m_vertices_VBO_ids[buffer_idx]));
-            glsafe(::glBindBuffer(GL_ARRAY_BUFFER, m_vertices_VBO_ids[buffer_idx]));
-            glsafe(::glBufferData(GL_ARRAY_BUFFER, patch_vertices.size() * sizeof(float), patch_vertices.data(), GL_STATIC_DRAW));
-            glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
-            //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: buffer_idx %2%, vertices size %3%, buffer id %4%")%__LINE__%buffer_idx%patch_vertices.size()%m_vertices_VBO_ids[buffer_idx];
-            patch_vertices.clear();
-        }
-
-        std::vector<int>& triangle_indices = m_triangle_patches[buffer_idx].triangle_indices;
-        m_triangle_indices_sizes[buffer_idx] = triangle_indices.size();
-        if (!triangle_indices.empty()) {
-            glsafe(::glGenBuffers(1, &m_triangle_indices_VBO_ids[buffer_idx]));
-            glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_triangle_indices_VBO_ids[buffer_idx]));
-            glsafe(::glBufferData(GL_ELEMENT_ARRAY_BUFFER, triangle_indices.size() * sizeof(int), triangle_indices.data(), GL_STATIC_DRAW));
-            glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-            //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: buffer_idx %2%, vertices size %3%, buffer id %4%")%__LINE__%buffer_idx%triangle_indices.size()%m_triangle_indices_VBO_ids[buffer_idx];
-            triangle_indices.clear();
-        }
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, m_vertices_VBO_ids[buffer_idx]));
+        glsafe(::glBufferData(GL_ARRAY_BUFFER, patch_vertices.size() * sizeof(float), patch_vertices.data(), GL_DYNAMIC_DRAW));
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+        patch_vertices.clear();
     }
 
 #if !SLIC3R_OPENGL_ES
@@ -1949,6 +2035,10 @@ void TriangleSelectorGUI::render_debug(ImGuiWrapper* imgui)
 
 void TriangleSelectorGUI::update_paint_contour()
 {
+    // Orca: rebuild the contour only when the seed fill selection or the triangle tree changed.
+    if (m_paint_contour_revision == this->seed_fill_revision())
+        return;
+    m_paint_contour_revision = this->seed_fill_revision();
     m_paint_contour.reset();
 
     GLModel::Geometry init_data;

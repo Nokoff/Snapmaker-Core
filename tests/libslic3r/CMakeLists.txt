@@ -75,6 +75,8 @@ add_executable(${_TEST_NAME}_tests
     test_stl.cpp
     test_triangle_mesh_deal.cpp
     test_triangle_selector.cpp
+    test_painting_updates.cpp
+    test_slice_mesh_single_plane.cpp
     test_meshboolean.cpp
     test_mesh_repair.cpp
     test_trianglemesh_slicer.cpp
