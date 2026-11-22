@@ -7785,11 +7785,12 @@ struct Plater::priv
     // extension should contain the leading dot, i.e.: ".3mf"
     wxString get_project_filename(const wxString& extension = wxEmptyString) const;
     wxString get_export_gcode_filename(const wxString& extension = wxEmptyString, bool only_filename = false, bool export_all = false) const;
-    void set_project_filename(const wxString& filename);
+    void set_project_filename(const wxString& filename, bool geometry_only = false);
 
     //BBS store bbs project name
     wxString get_project_name();
     void set_project_name(const wxString& project_name);
+    bool import_may_rename_project() const { return ProjectPaths::import_may_rename(m_project_folder, m_project_name == _L("Untitled")); }
     void update_title_dirty_status();
 
     // Call after plater and Canvas#D is initialized
@@ -14827,7 +14828,7 @@ void Plater::priv::update_title_dirty_status()
 #endif    
 }
 
-void Plater::priv::set_project_filename(const wxString& filename)
+void Plater::priv::set_project_filename(const wxString& filename, bool geometry_only)
 {
     boost::filesystem::path full_path = into_path(filename);
     boost::filesystem::path ext = full_path.extension();
@@ -14842,7 +14843,7 @@ void Plater::priv::set_project_filename(const wxString& filename)
     //    // Remove just one extension.
     //    full_path.replace_extension("");
     //}
-    m_project_folder = ProjectPaths::project_folder(full_path, q->m_only_gcode);
+    m_project_folder = ProjectPaths::project_folder(full_path, q->m_only_gcode, geometry_only);
     full_path.replace_extension("");
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << __LINE__ << " project folder is:" << m_project_folder.string();
 
@@ -16592,8 +16593,9 @@ void Plater::load_project(wxString const& filename2,
         input_paths.push_back(into_u8(originfile));
 
     bool loaded_published   = false;
+    bool settings_loaded    = false;
     std::vector<size_t> res = load_files(input_paths, strategy, false, &loaded_published,
-                                         replace_when_ready ? replace_project : std::function<void()>());
+                                         replace_when_ready ? replace_project : std::function<void()>(), &settings_loaded);
     // The import was cancelled or failed before the project was replaced.
     if (!snapshot)
         return;
@@ -16605,7 +16607,9 @@ void Plater::load_project(wxString const& filename2,
     // if res is empty no data has been loaded
     if (!res.empty() && !loaded_published && (load_restore || !(strategy & LoadStrategy::Silence))) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " call set_project_filename: " << (load_restore ? originfile : filename);
-        p->set_project_filename(load_restore ? originfile : filename);
+        // Whether by choice or because the file had no settings to load
+        const bool geometry_only = !load_restore && !settings_loaded && !m_exported_file;
+        p->set_project_filename(load_restore ? originfile : filename, geometry_only);
         if (load_restore && originfile.IsEmpty()) {
         p->set_project_name(_L("Untitled"));
         }
@@ -16633,6 +16637,9 @@ void Plater::load_project(wxString const& filename2,
         }
 
     }
+    // Reading a 3MF records it for crash recovery even when it does not become the project
+    if (!load_restore && p->get_project_filename().IsEmpty())
+        ProjectPaths::forget_origin(model().get_backup_path());
 
     // BBS set default 3D view and direction after loading project
     //p->select_view_3D("3D");
@@ -16952,8 +16959,13 @@ void Plater::import_model_id(wxString download_info)
         /* load project */
         // Orca: If download is a zip file, treat it as if file has been drag and dropped on the plater
         if (target_path.extension() == ".zip")
-            { wxArrayString arr; arr.Add(from_path(target_path)); this->load_files(arr); }
-        else
+        {
+            wxArrayString arr;
+            arr.Add(from_path(target_path));
+            this->load_files(arr);
+            p->set_project_filename(target_path.wstring());
+        } else
+            // load_project() names the project, as only it knows whether the file became one
             this->load_project(from_path(target_path));
         /*BBS set project info after load project, project info is reset in load project */
         //p->project.project_model_id = model_id;
@@ -16964,7 +16976,6 @@ void Plater::import_model_id(wxString download_info)
         }
 
         // show save new project
-        p->set_project_filename(target_path.wstring());
         p->notification_manager->push_import_finished_notification(target_path.string(), target_path.parent_path().string(), false);
     }
     else {
@@ -17066,7 +17077,7 @@ bool Plater::add_model(bool imperial_units, std::string fname)
     const bool loaded = !load_files(paths, strategy, ask_multi).empty();
     if (loaded) {
 
-        if (get_project_name() == _L("Untitled") && paths.size() > 0) {
+        if (p->import_may_rename_project() && paths.size() > 0) {
             boost::filesystem::path full_path(paths[0].string());
             p->set_project_name(from_u8(full_path.stem().string()));
         }
@@ -18847,7 +18858,7 @@ void Plater::force_update_all_plate_thumbnails()
 
 // BBS: backup
 std::vector<size_t> Plater::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi, bool* published_out,
-                                       const std::function<void()>& before_publish) {
+                                       const std::function<void()>& before_publish, bool* config_loaded_out) {
     auto reset_load_state = [this]() {
         //BBS: wish to reset state when load a new file
         p->m_slice_all_only_has_gcode = false;
@@ -18865,6 +18876,8 @@ std::vector<size_t> Plater::load_files(const std::vector<fs::path>& input_files,
         reset_load_state();
     bool config_loaded = false;
     std::vector<size_t> result = p->load_files(input_files, strategy, ask_multi, published_out, &config_loaded, publish);
+    if (config_loaded_out != nullptr)
+        *config_loaded_out = config_loaded;
     if (config_loaded && !is_loading_project())
         normalize_bed_types(false);
     return result;
@@ -19495,7 +19508,7 @@ void Plater::add_file()
         if (first_3mf_action == LoadType::LoadGeometry) {
             Plater::TakeSnapshot snapshot(this, snapshot_label);
             if (!load_files(paths, LoadStrategy::LoadModel, false).empty()) {
-                if (get_project_name() == _L("Untitled"))
+                if (p->import_may_rename_project())
                     p->set_project_name(from_u8(paths.front().stem().string()));
                 wxGetApp().mainframe->update_title();
                 if (wxGetApp().app_config->get("recent_models") == "true")
@@ -19529,7 +19542,7 @@ void Plater::add_file()
     case LoadFilesType::SingleOther: {
         Plater::TakeSnapshot snapshot(this, snapshot_label);
         if (!load_files(paths, LoadStrategy::LoadModel, false).empty()) {
-            if (get_project_name() == _L("Untitled") && paths.size() > 0) {
+            if (p->import_may_rename_project() && paths.size() > 0) {
                 boost::filesystem::path full_path(paths[0].string());
                 p->set_project_name(from_u8(full_path.stem().string()));
             }
@@ -19552,7 +19565,7 @@ void Plater::add_file()
     case LoadFilesType::MultipleOther: {
         Plater::TakeSnapshot snapshot(this, snapshot_label);
         if (!load_files(paths, LoadStrategy::LoadModel, true).empty()) {
-            if (get_project_name() == _L("Untitled") && paths.size() > 0) {
+            if (p->import_may_rename_project() && paths.size() > 0) {
                 boost::filesystem::path full_path(paths[0].string());
                 p->set_project_name(from_u8(full_path.stem().string()));
             }

@@ -4,9 +4,12 @@
 
 #include <string>
 
+#include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/path.hpp>
 
+#include "libslic3r/Format/bbs_3mf.hpp"
 #include "slic3r/Utils/ProjectPaths.hpp"
+#include "test_utils.hpp"
 
 using namespace Slic3r;
 namespace fs = boost::filesystem;
@@ -32,6 +35,42 @@ TEST_CASE("A 3MF project is saved beside where it was opened", "[ProjectPaths]")
 TEST_CASE("A G-code preview keeps the folder it was opened from", "[ProjectPaths]")
 {
     CHECK(ProjectPaths::project_folder(fs::path("models") / "part.gcode", true) == fs::path("models"));
+}
+
+TEST_CASE("A 3MF imported as geometry gives Save no file to overwrite", "[ProjectPaths][Regression]")
+{
+    const std::string name = GENERATE(std::string("part.3mf"), std::string("part.3MF"));
+    CAPTURE(name);
+
+    CHECK(ProjectPaths::project_folder(fs::path("models") / name, false, true).empty());
+}
+
+TEST_CASE("Importing into a saved project named Untitled keeps its name", "[ProjectPaths][Regression]")
+{
+    const fs::path folder = ProjectPaths::project_folder(fs::path("models") / "Untitled.3mf", false);
+
+    CHECK_FALSE(ProjectPaths::import_may_rename(folder, true));
+}
+
+TEST_CASE("Importing names only an untitled project that was never saved", "[ProjectPaths]")
+{
+    CHECK(ProjectPaths::import_may_rename(fs::path(), true));
+    CHECK_FALSE(ProjectPaths::import_may_rename(fs::path(), false));
+}
+
+TEST_CASE("Crash recovery does not return to a file that was not opened as a project", "[ProjectPaths][Regression]")
+{
+    ScopedTemporaryDir backup("project-paths");
+    const fs::path     dir = fs::path(backup.string());
+    fs::ofstream(dir / ".3mf") << "backup";
+    fs::ofstream(dir / "origin.txt") << "models/part.3mf";
+
+    ProjectPaths::forget_origin(dir);
+
+    std::string path = dir.string();
+    std::string origin;
+    REQUIRE(has_restore_data(path, origin));
+    CHECK(origin.empty());
 }
 
 TEST_CASE("An untitled project has no folder", "[ProjectPaths]")

@@ -462,7 +462,7 @@ public:
 
     // BBS: restore
     std::vector<size_t> load_files(const std::vector<boost::filesystem::path>& input_files, LoadStrategy strategy = LoadStrategy::LoadModel | LoadStrategy::LoadConfig,  bool ask_multi = false, bool* published_out = nullptr,
-                                   const std::function<void()>& before_publish = nullptr);
+                                   const std::function<void()>& before_publish = nullptr, bool* config_loaded_out = nullptr);
     // to be called on drag and drop
     bool load_files(const wxArrayString& filenames);
 
