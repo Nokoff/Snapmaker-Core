@@ -119,6 +119,9 @@ option(SLIC3R_WARNINGS          "Emit compiler warnings for OrcaSlicer sources" 
 option(SLIC3R_BUNDLED_WARNINGS  "Emit compiler warnings for bundled third-party sources" 0)
 option(SLIC3R_MSVC_COMPILE_PARALLEL "Compile on Visual Studio in parallel" 1)
 option(SLIC3R_MSVC_PDB          "Generate PDB files on MSVC in Release mode" 1)
+set(SLIC3R_MSVC_ARCH "" CACHE STRING "MSVC /arch: instruction set, for x64 builds that will only run on such CPUs (empty = compiler default)")
+set_property(CACHE SLIC3R_MSVC_ARCH PROPERTY STRINGS "" AVX2 AVX512)
+option(SLIC3R_MSVC_LTO          "MSVC whole-program optimization (/GL + /LTCG) for Release, linking needs a lot of memory" OFF)
 option(SLIC3R_RELATIVE_DEBUG_PATHS "Record a relative compilation directory in debug info (clang-cl)" 0)
 option(SLIC3R_ASAN              "Enable ASan on Clang and GCC" 0)
 option(SLIC3R_GLIBCXX_ASSERTIONS "Enable libstdc++'s lightweight checks (_GLIBCXX_ASSERTIONS)" 0)
@@ -434,6 +437,33 @@ if (MSVC)
 	# helps incremental builds by preventing the double-link restart from TBB
     set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /LTCG")
+
+    # Opt-in CPU tuning, both off by default
+    if (SLIC3R_MSVC_ARCH)
+        if (NOT SLIC3R_MSVC_ARCH MATCHES "^(AVX2|AVX512)$")
+            message(FATAL_ERROR "SLIC3R_MSVC_ARCH must be empty, AVX2 or AVX512 (got '${SLIC3R_MSVC_ARCH}')")
+        endif ()
+        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64")
+            message(FATAL_ERROR "SLIC3R_MSVC_ARCH only applies to x64 builds")
+        endif ()
+        message(STATUS "MSVC: /arch:${SLIC3R_MSVC_ARCH}")
+        add_compile_options(/arch:${SLIC3R_MSVC_ARCH})
+        if (SLIC3R_MSVC_ARCH STREQUAL "AVX512")
+            # Eigen 5 marks its AVX-512 kernels __forceinline, on which cl.exe does not finish compiling
+            # (Geometry.cpp, LayOnFace.cpp, SeamPlacer.cpp). Plain inline leaves the choice to the optimiser.
+            add_compile_definitions(EIGEN_STRONG_INLINE=inline)
+        endif ()
+    endif ()
+    if (SLIC3R_MSVC_LTO)
+        if (IS_CLANG_CL)
+            message(FATAL_ERROR "SLIC3R_MSVC_LTO needs cl.exe, clang-cl does not take /GL")
+        endif ()
+        # /GL is added per target at the end of this file
+        message(STATUS "MSVC: LTO enabled (/GL, /LTCG) for Release")
+        foreach (_type MODULE STATIC)
+            set(CMAKE_${_type}_LINKER_FLAGS_RELEASE "${CMAKE_${_type}_LINKER_FLAGS_RELEASE} /LTCG")
+        endforeach ()
+    endif ()
 endif ()
 
 # Without this every object names its build directory and two worktrees never
@@ -1434,4 +1464,31 @@ endif ()
 
 set(CPACK_WIX_UPGRADE_GUID "058245e8-20e0-4a95-9ab7-1acfe17ad511")
 set(CPACK_GENERATOR NSIS)
+if (MSVC AND SLIC3R_MSVC_ARCH)
+    # Such an installer fails on other CPUs, so it must not share the portable one's name
+    string(TOLOWER "_${SLIC3R_MSVC_ARCH}" _orca_cpu_suffix)
+    string(APPEND CPACK_PACKAGE_FILE_NAME "${_orca_cpu_suffix}")
+endif ()
 include(CPack)
+
+if (MSVC AND SLIC3R_MSVC_LTO)
+    # Every compiled target except libslic3r_gui, whose LTCG static library exceeds lib.exe's 4 GB limit.
+    # Objects built with and without /GL link together under /LTCG.
+    function(orcaslicer_collect_targets dir out)
+        get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+        get_property(_subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+        foreach (_subdir ${_subdirs})
+            orcaslicer_collect_targets(${_subdir} _subdir_targets)
+            list(APPEND _targets ${_subdir_targets})
+        endforeach ()
+        set(${out} ${_targets} PARENT_SCOPE)
+    endfunction ()
+    orcaslicer_collect_targets(${CMAKE_CURRENT_SOURCE_DIR} _orca_lto_targets)
+    foreach (_target ${_orca_lto_targets})
+        get_target_property(_type ${_target} TYPE)
+        if (_type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY|STATIC_LIBRARY|OBJECT_LIBRARY)$"
+            AND NOT _target STREQUAL "libslic3r_gui")
+            target_compile_options(${_target} PRIVATE "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/GL>")
+        endif ()
+    endforeach ()
+endif ()
